@@ -29,7 +29,8 @@
             [clojure.data.csv :as data-csv]
             [medley.core :as medley]
             [argumentica.db.common :as common]
-            [camel-snake-kebab.core :as camel-snake-kebab]))
+            [camel-snake-kebab.core :as camel-snake-kebab])
+  (:gen-class))
 
 (defn filter-by-attributes [attributes-set index-definition]
   (assoc index-definition
@@ -89,16 +90,20 @@
                                   prepare-key-name]
                            :or {parse-value identity
                                 prepare-key-name identity}}]
-  (fn [reducing-function]
+  (fn [rf]
     (let [keys (volatile! nil)]
-      (completing (fn [result row]
-                    (if (nil? @keys)
-                      (do (vreset! keys (map (comp keyword
-                                                   prepare-key-name)
-                                             row))
-                          result)
-                      (reducing-function result
-                                         (zipmap @keys (map parse-value row)))))))))
+      (fn
+        ([result]
+         (rf result))
+
+        ([result row]
+         (if (nil? @keys)
+           (do (vreset! keys (map (comp keyword
+                                        prepare-key-name)
+                                  row))
+               result)
+           (rf result
+               (zipmap @keys (map parse-value row)))))))))
 
 (deftest test-csv-rows-to-maps
   (is (= [{:a 1, :b 2}]
@@ -132,9 +137,24 @@
                    (:reducer options)
                    rows)))))
 
+(defn test-transducer [rf]
+  (fn
+    ([]
+     (prn "initialize")
+     (rf))
+
+    ([result]
+     (prn "finished" result)
+     (rf result))
+
+    ([result input]
+     (prn "reduce" result input)
+     (rf result input))))
+
 (comment
   (transduce-csv "temp/sample.csv"
-                 (take 2)
+                 (comp (take 2)
+                       test-transducer)
                  :reducer conj)
 
   (transduce-csv food-file-name
@@ -150,30 +170,83 @@
 
   (transact)
 
-  (when (instance? argumentica.btree_index.BtreeIndex
-                   (-> db :indexes vals first :index))
-    (btree-db/store-index-roots-after-maximum-number-of-transactions db 0))
-
   (transaction-log/truncate! (:transaction-log db)
                              (inc (transaction-log/last-transaction-number (:transaction-log db))))
   (transaction-log/make-persistent! (:transaction-log db))
   nil)
 
-(defn make-transact-transducer [db-atom transducer]
+(defn- finish-batch [state-atom batch-size entity-count db-atom]
+  (let [elapsed-time (/ (- (System/currentTimeMillis)
+                           (:last-batch-ended @state-atom))
+                        1000)]
+    (println (java.util.Date.)
+             (str (:count @state-atom) "/" entity-count)
+             (str (int (* 100 (/ (:count @state-atom)
+                                 entity-count)))
+                  "%")
+             (float elapsed-time)
+             "minutes remaining:"
+             (float (/ (* (/ (- entity-count
+                              (:count @state-atom))
+                           batch-size)
+                          elapsed-time)
+                       60))))
+
+  (when (instance? argumentica.btree_index.BtreeIndex
+                   (-> @db-atom :indexes vals first :index))
+    (swap! db-atom (fn [db]
+                     (-> db
+                         (btree-db/store-index-roots-after-maximum-number-of-transactions 0)
+                         ;; TODO: store-index-roots-after-maximum-number-of-transactions already unloads all nodes but it would not need to
+                         (btree-db/unload-nodes 20)
+                         (btree-db/remove-old-roots)
+                         (btree-db/collect-storage-garbage)))))
+
+  (swap! state-atom assoc :last-batch-ended (System/currentTimeMillis)))
+
+(defn batching-transducer [db-atom entity-count]
+  (let [batch-size 60
+        state-atom (atom {:count 0
+                          :last-batch-ended (System/currentTimeMillis)})]
+    (fn [rf]
+      (fn
+        ([] (rf))
+
+        ([result]
+         (finish-batch state-atom batch-size entity-count db-atom)
+         (rf result))
+
+        ([result input]
+         (swap! state-atom update :count inc)
+         (when (= 0
+                  (mod (:count @state-atom)
+                       batch-size))
+           (finish-batch state-atom batch-size entity-count db-atom))
+         (rf result input))))))
+
+(comment
+  (transduce batching-transducer conj [1 2 3])
+  ) ;; TODO: remove-me
+
+(defn make-transact-transducer [db-atom transducer entity-count]
   (comp (csv-rows-to-maps :parse-value (comp empty-string-to-nil
                                              parse-number))
         transducer
         (map map-to-transaction/maps-to-transaction)
         (map (fn [transaction]
                (swap! db-atom db-common/transact transaction)))
-        #_(map (fn [_]
-                 (swap! db-atom btree-db/store-index-roots-after-maximum-number-of-transactions 10000)))))
+        (batching-transducer db-atom entity-count)))
+
+(defn line-count [file-name]
+  (with-open [rdr (clojure.java.io/reader file-name)]
+    (count (line-seq rdr))))
+
 
 (defn transact-csv [db-atom file-name transducer]
   (transact-many! @db-atom
                   (fn []
                     (transduce-csv file-name
-                                   (make-transact-transducer db-atom transducer)))))
+                                   (make-transact-transducer db-atom transducer (dec (line-count file-name)))))))
 
 
 (defn transact-with-transducer [db-atom transducer entities]
@@ -304,19 +377,24 @@
                   :fdc_id 1})
 
 (def food-nutrient-index-definitions [db-common/eav-index-definition
-                                      #_(filter-by-attributes #{:name :description}
-                                                              db-common/full-text-index-definition)
-
-                                      #_(filter-by-attributes #{:food :amount}
-                                                              db-common/avetc-index-definition)
-                                      (db-common/composite-index-definition :text
-                                                                            [:data_type
+                                      (db-common/composite-index-definition :data-type-text
+                                                                            [:data-type
                                                                              {:attributes [:name :description]
-                                                                              :value-funciton db-common/tokenize}])
-                                      (db-common/composite-index-definition :data-type [:data_type])
-                                      (db-common/composite-index-definition :food-nutrient-amount [:food :nutrient :amount])
-                                      (db-common/composite-index-definition :nutrient-amount-food [:nutrient :amount :food])])
+                                                                              :value-function db-common/tokenize}])
+                                      ;; (db-common/enumeration-index-definition :data-type :data-type)
+                                      ;; (db-common/composite-index-definition :food-nutrient-amount [:food :nutrient :amount])
+                                      ;;(db-common/composite-index-definition :nutrient-amount-food [:nutrient :amount :food])
+                                      ])
 (comment
+
+  (storage/get-edn-from-storage! (directory-storage/create "temp/food_nutrient/data-type-text/metadata")
+                                 "roots")
+  (storage/get-edn-from-storage! (directory-storage/create "temp/food_nutrient/data-type-text/metadata")
+                                 "F14B3A0514F2EE1E1542F759ED5A62AD869BDAC3724EF85E406D299BB4D44577")
+
+  (storage/get-edn-from-storage! (directory-storage/create "temp/food_nutrient/data-type-text/nodes")
+                                 "F14B3A0514F2EE1E1542F759ED5A62AD869BDAC3724EF85E406D299BB4D44577")
+
   (let [db-atom (atom (create-in-memory-db food-nutrient-index-definitions))]
     (transact-csv db-atom
                   food-nutrient-file-name
@@ -379,27 +457,29 @@
 
   (time (def food-nutrient-db-atom (let [path "temp/food_nutrient"
                                          _ (reset-directory path)
-                                         db-atom (atom (create-in-memory-db food-nutrient-index-definitions)
-                                                       #_(create-db path food-nutrient-index-definitions))]
-                                     (transact-csv db-atom
-                                                   food-nutrient-file-name
-                                                   (comp (take 1000)
-                                                         (map (partial-right prepare food-nutrient-key-specification))))
-                                     (transact-csv db-atom
-                                                   nutrient-file-name
-                                                   (comp (take 1000)
-                                                         (map (partial-right prepare nutrient-key-specification))))
+                                         db-atom (atom #_(create-in-memory-db food-nutrient-index-definitions)
+                                                       (create-db path food-nutrient-index-definitions))]
+                                     #_(transact-csv db-atom
+                                                     food-nutrient-file-name
+                                                     (comp (take 1000)
+                                                           (map (partial-right prepare food-nutrient-key-specification))))
+
+                                     #_(transact-csv db-atom
+                                                     nutrient-file-name
+                                                     (comp (take 1000)
+                                                           (map (partial-right prepare nutrient-key-specification))))
 
                                      (transact-csv db-atom
-                                                   food-file-name
-                                                   (comp (take 1000)
+                                                   #_food-file-name
+                                                   "temp/food-sample"
+                                                   (comp #_(take 1000)
                                                          (map (partial-right prepare food-key-specification))))
 
 
                                      db-atom)))
 
-  (count (transduce-csv nutrient-file-name
-                        identity
+  (count (transduce-csv food-file-name
+                        identity #_(take 10)
                         :reducer conj))
 
   (defn entity [id]
@@ -426,6 +506,24 @@
                              {:fdc_id {:reference? true}
                               :nutrient_id {:reference? true}}
                              "nutrient-1293"))
+
+  (-> @food-nutrient-db-atom
+      :indexes
+      :data-type-text)
+
+  (take 10 (db-common/propositions @food-nutrient-db-atom
+                                   :data-type-text
+                                   []))
+
+  (defn query-foods [data-type query]
+    (take 10 (map last (db-common/propositions @food-nutrient-db-atom
+                                               :data-type-text
+                                               [data-type query]))))
+
+  (map :description (map entity (query-foods "branded_food" "potato")))
+
+  (common/values-from-enumeration @food-nutrient-db-atom
+                                  :data-type)
 
   (take 100 (db-common/propositions @food-nutrient-db-atom
                                     :nutrient-amount-food
@@ -559,3 +657,6 @@
 
   ;; TODO: remove-me
   )
+
+(defn -main [& arguments]
+  (println "moi"))
