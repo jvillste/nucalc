@@ -36,7 +36,8 @@
             [nucalc.serialization :as serialization]
             [clj-time.core :as clj-time]
             [clj-time.format :as format]
-            [clj-time.local :as local])
+            [clj-time.local :as local]
+            [taoensso.tufte :as tufte])
   (:gen-class))
 
 (defn filter-by-attributes [attributes-set index-definition]
@@ -60,8 +61,8 @@
 (defn create-db [path index-definitions]
   (db-common/db-from-index-definitions index-definitions
                                        (fn [index-key]
-                                         (btree-index/create-directory-btree-index (str path "/" (name index-key))
-                                                                                   10001))
+                                         (btree-collection/create-on-disk (str path "/" (name index-key))
+                                                                          {:node-size 10001}))
                                        (file-transaction-log/create (str path "/transaction-log"))))
 
 (defn create-in-memory-db [index-definitions]
@@ -192,14 +193,14 @@
                             batch-size))
                   " milliseconds per entity.")
              (int (/ (* (/ (- entity-count
-                                (:count @state-atom))
-                             batch-size)
-                          elapsed-time)
-                       60
-                       1000))
+                              (:count @state-atom))
+                           batch-size)
+                        elapsed-time)
+                     60
+                     1000))
              "minutes remaining."))
 
-  (when (instance? argumentica.btree_index.BtreeIndex
+  (when (instance? argumentica.btree_collection.BtreeCollection
                    (-> @db-atom :indexes vals first :collection))
     (swap! db-atom (fn [db]
                      (-> db
@@ -392,19 +393,19 @@
 
 (def food-nutrient-index-definitions [db-common/eav-index-definition
                                       (db-common/composite-index-definition :data-type-text
-                                                                            [:data-type
-                                                                             {:attributes [:name :description]
-                                                                              :value-function db-common/tokenize}])
-                                      (db-common/enumeration-index-definition :data-type :data-type)
-                                      (db-common/composite-index-definition :food-nutrient-amount [:food :nutrient :amount])
+                                                                              [:data-type
+                                                                               {:attributes [:name :description]
+                                                                                :value-function db-common/tokenize}])
+                                      #_(db-common/enumeration-index-definition :data-type :data-type)
+                                      #_(db-common/composite-index-definition :food-nutrient-amount [:food :nutrient :amount])
                                       #_(db-common/composite-index-definition :nutrient-amount-food [:nutrient :amount :food])
-                                      (db-common/rule-index-definition :nutrient-amount-food {:head [:?data-type :?nutrient :?amount :?food :?description]
-                                                                                              :body [[:eav
-                                                                                                      [:?measurement :amount :?amount]
-                                                                                                      [:?measurement :nutrient :?nutrient]
-                                                                                                      [:?measurement :food :?food]
-                                                                                                      [:?food :data-type :?data-type]
-                                                                                                      [:?food :description :?description]]]})])
+                                      #_(db-common/rule-index-definition :nutrient-amount-food {:head [:?data-type :?nutrient :?amount :?food :?description]
+                                                                                                :body [[:eav
+                                                                                                        [:?measurement :amount :?amount]
+                                                                                                        [:?measurement :nutrient :?nutrient]
+                                                                                                        [:?measurement :food :?food]
+                                                                                                        [:?food :data-type :?data-type]
+                                                                                                        [:?food :description :?description]]]})])
 
 
 (comment
@@ -523,49 +524,55 @@
                                                                                                          (map (partial-right prepare key-specification)))
                                                                                                    entity-count))))))
 
+(def non-branded-foods-file-name "temp/non-branded-foods.data")
+(def non-branded-food-nutrient-file-name "temp/non-branded-food-nutrients.data")
+
+(tufte/add-basic-println-handler! {})
+
 (defn load-data-to-db []
-  (time (def db-atom (let [path "temp/food_nutrient"
-                           _ (reset-directory path)
-                           db-atom (atom #_(create-in-memory-db #_food-nutrient-index-definitions
-                                                              [db-common/eav-index-definition
-                                                               (db-common/enumeration-index-definition :data-type :data-type)])
-                                         (create-db path food-nutrient-index-definitions))]
+  (time (def db-atom (tufte/profile {}
+                      (let [path "temp/food_nutrient"
+                            _ (reset-directory path)
+                            db-atom (atom #_(create-in-memory-db food-nutrient-index-definitions
+                                                               #_[db-common/eav-index-definition
+                                                                  (db-common/enumeration-index-definition :data-type :data-type)])
+                                          (create-db path food-nutrient-index-definitions))]
 
-                       (transact-data-file db-atom
-                                           non-branded-foods-file-name
-                                           identity #_(take 100)
-                                           food-key-specification
-                                           35727)
-                       #_(transact-data-file db-atom
-                                             non-branded-food-nutrient-file-name
-                                             (take 100)
-                                             food-nutrient-key-specification
-                                             1304201)
+                        (transact-data-file db-atom
+                                            non-branded-foods-file-name
+                                            #_identity (take 10)
+                                            food-key-specification
+                                            35727)
+                        #_(transact-data-file db-atom
+                                              non-branded-food-nutrient-file-name
+                                              (take 100)
+                                              food-nutrient-key-specification
+                                              1304201)
                        
-                       #_(transact-csv db-atom
-                                       #_food-file-name
-                                       "temp/food-sample"
-                                       (comp (take 100)
-                                             (map (partial-right prepare food-key-specification))))
+                        #_(transact-csv db-atom
+                                        #_food-file-name
+                                        "temp/food-sample"
+                                        (comp (take 100)
+                                              (map (partial-right prepare food-key-specification))))
 
-                       #_(let [food-id-set (set (map first (db-common/datoms-from @db-atom
-                                                                                  :eav
-                                                                                  [nil :category])))])
-                       #_(transact-csv db-atom
-                                       food-nutrient-file-name
-                                       (comp (take 100)
-                                             (filter (fn [food-nutrient]
-                                                       (contains? food-id-set
-                                                                  (str "food-" (:fdc_id)))))
-                                             (map (partial-right prepare food-nutrient-key-specification))))
+                        #_(let [food-id-set (set (map first (db-common/datoms-from @db-atom
+                                                                                   :eav
+                                                                                   [nil :category])))])
+                        #_(transact-csv db-atom
+                                        food-nutrient-file-name
+                                        (comp (take 100)
+                                              (filter (fn [food-nutrient]
+                                                        (contains? food-id-set
+                                                                   (str "food-" (:fdc_id)))))
+                                              (map (partial-right prepare food-nutrient-key-specification))))
 
-                       #_(transact-csv db-atom
-                                       nutrient-file-name
-                                       (comp (take 100)
-                                             (map (partial-right prepare nutrient-key-specification))))
+                        #_(transact-csv db-atom
+                                        nutrient-file-name
+                                        (comp (take 100)
+                                              (map (partial-right prepare nutrient-key-specification))))
 
 
-                       db-atom))))
+                        db-atom)))))
 
 (defn sample-indexes [db-atom]
   (for [index-key (keys (:indexes @db-atom))]
@@ -581,7 +588,7 @@
 
   ;; non branded foods
 
-  (def non-branded-foods-file-name "temp/non-branded-foods.data")
+
   (def writing-future (write-csv-rows-to-data-file food-file-name
                                                    non-branded-foods-file-name
                                                    (filter (fn [food]
@@ -597,7 +604,7 @@
 
   ;; non branded food-nutrients
 
-  (def non-branded-food-nutrient-file-name "temp/non-branded-food-nutrients.data")
+
   (def writing-future (write-csv-rows-to-data-file food-nutrient-file-name
                                                    non-branded-food-nutrient-file-name
                                                    (filter (fn [food-nutrient]

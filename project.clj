@@ -9,7 +9,8 @@
                  [org.clojure/data.csv "1.0.0"]
                  [medley "1.2.0"]
                  [me.raynes/fs "1.4.6"]
-                 [com.taoensso/nippy "2.13.0"]]
+                 [com.taoensso/nippy "2.13.0"]
+                 [com.taoensso/tufte "2.1.0"]]
   :main nucalc.core
 ;;  :aot [nucalc.core]
   )
