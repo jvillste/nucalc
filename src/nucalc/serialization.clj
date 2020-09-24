@@ -1,7 +1,9 @@
 (ns nucalc.serialization
   (:require [clojure.java.io :as io]
             [taoensso.nippy :as nippy])
-  (:import [java.io DataInputStream DataOutputStream EOFException]))
+  (:import [java.io DataInputStream DataOutputStream EOFException]
+           clojure.lang.IReduceInit
+           clojure.lang.IReduce))
 
 (defn with-data-output-stream [file-name function]
   (with-open [data-output-stream (DataOutputStream. (io/output-stream (io/file file-name)))]
@@ -50,6 +52,19 @@
                 (reducing-function @result)
                 (recur result buffer))))
           (reducing-function value))))))
+
+(defn file-reducible [file-name]
+  (reify
+    IReduceInit
+    (reduce [this reducing-function initial-value]
+      (transduce-file file-name
+                      :reducer reducing-function
+                      :initial-value initial-value))
+
+    IReduce
+    (reduce [this reducing-function]
+      (transduce-file file-name
+                      :reducer reducing-function))))
 
 (comment
   (write-file "temp/test.data" 10 (range 100))
