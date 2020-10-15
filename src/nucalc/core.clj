@@ -36,7 +36,8 @@
             [clj-time.core :as clj-time]
             [clj-time.format :as format]
             [clj-time.local :as local]
-            [taoensso.tufte :as tufte])
+            [taoensso.tufte :as tufte]
+            [clojure.core.reducers :as reducers])
   (:gen-class))
 
 (defn filter-by-attributes [attributes-set index-definition]
@@ -393,23 +394,6 @@
                   :publication_date "2019-04-01",
                   :fdc_id 1})
 
-(def food-nutrient-index-definitions [db-common/eav-index-definition
-                                      ;; (db-common/composite-index-definition :data-type-text
-                                      ;;                                       [:data-type
-                                      ;;                                        {:attributes [:name :description]
-                                      ;;                                         :value-function db-common/tokenize}])
-                                      #_(db-common/enumeration-index-definition :data-type :data-type)
-                                      (db-common/composite-index-definition :food-nutrient-amount [:food :nutrient :amount])
-                                      #_(db-common/composite-index-definition :nutrient-amount-food [:nutrient :amount :food])
-                                      ;; (db-common/rule-index-definition :nutrient-amount-food {:head [:?data-type :?nutrient :?amount :?food :?description]
-                                      ;;                                                           :body [[:eav
-                                      ;;                                                                   [:?measurement :amount :?amount]
-                                      ;;                                                                   [:?measurement :nutrient :?nutrient]
-                                      ;;                                                                   [:?measurement :food :?food]
-                                      ;;                                                                   [:?food :data-type :?data-type]
-                                      ;;                                                                   [:?food :description :?description]]]})
-                                      ])
-
 
 (comment
   [[:measurement? :nutrient :nutrient?]
@@ -489,18 +473,6 @@
                              true))))
     db-atom))
 
-(defn create-food-db [path]
-  (atom #_(create-in-memory-db food-nutrient-index-definitions)
-        (create-db path food-nutrient-index-definitions)))
-
-(defn reset-db []
-  (def count-atom (atom 0))
-  (fs/delete-dir "temp/db")
-  (fs/mkdirs "temp/db")
-  (def db-atom (atom (create-food-db "temp/db")))
-  nil)
-
-
 (defn local-time-as-string []
   (format/unparse (format/formatter-local "HH:mm:ss")
                   (local/local-now)))
@@ -530,6 +502,13 @@
 (def non-branded-foods-file-name "temp/non-branded-foods.data")
 (def non-branded-food-nutrient-file-name "temp/non-branded-food-nutrients.data")
 (def non-branded-food-nutrient-sample-file-name "temp/non-branded-food-nutrient-sample.data")
+(def non-branded-food-nutrient-sample-3000-file-name "temp/non-branded-food-nutrient-sample-3000.data")
+
+(defn sample-indexes [db-atom]
+  (for [index-key (keys (:indexes @db-atom))]
+    [index-key (take 1 (db-common/propositions-from-index (db-common/index @db-atom index-key)
+                                                          ::comparator/min
+                                                          nil))]))
 
 (tufte/add-basic-println-handler! {})
 
@@ -537,62 +516,198 @@
   (tufte/profile {} (Thread/sleep 100))
   ) ;; TODO: remove-me
 
-(defn load-data-to-db []
-  (time (def db-atom (tufte/profile {}
-                                    (tufte/p :all
-                                             (let [path "temp/food_nutrient"
-                                                   _ (reset-directory path)
-                                                   db-atom (atom #_(create-in-memory-db food-nutrient-index-definitions
-                                                                                        #_[db-common/eav-index-definition
-                                                                                           (db-common/enumeration-index-definition :data-type :data-type)])
-                                                                 (create-db path food-nutrient-index-definitions))]
+;; todo: btree/next-sequence is called 30k times for each food!
 
-                                               (transact-data-file db-atom
-                                                                   non-branded-foods-file-name
-                                                                   #_identity (take 1000)
-                                                                   food-key-specification
-                                                                   35727)
-                                               (transact-data-file db-atom
-;;                                                                   non-branded-food-nutrient-file-name
-                                                                   non-branded-food-nutrient-sample-file-name
-                                                                   (take 200)
-                                                                   food-nutrient-key-specification
-                                                                   1304201)
+;; #inst "2020-09-24T05:22:36.153-00:00" 500/35727 1% Indexing 500 entities took 7.301 seconds. 14.602 milliseconds per entity. 8 minutes remaining.
+;; #inst "2020-09-24T05:22:56.400-00:00" 1000/35727 2% Indexing 500 entities took 20.208 seconds. 40.416 milliseconds per entity. 23 minutes remaining.
+;; #inst "2020-09-24T05:23:29.444-00:00" 1500/35727 4% Indexing 500 entities took 32.979 seconds. 65.958 milliseconds per entity. 37 minutes remaining.
+;; #inst "2020-09-24T05:24:13.014-00:00" 2000/35727 5% Indexing 500 entities took 43.481 seconds. 86.962 milliseconds per entity. 48 minutes remaining.
+;; #inst "2020-09-24T05:25:03.642-00:00" 2500/35727 6% Indexing 500 entities took 50.532 seconds. 101.064 milliseconds per entity. 55 minutes remaining.
+;; #inst "2020-09-24T05:26:07.861-00:00" 3000/35727 8% Indexing 500 entities took 64.099 seconds. 128.198 milliseconds per entity. 69 minutes remaining.
+;; #inst "2020-09-24T05:26:17.927-00:00" 3036/35727 8% Indexing 500 entities took 9.91 seconds. 19.82 milliseconds per entity. 10 minutes remaining.
+;; "Elapsed time: 229259.876068 msecs"
+;; done
 
-                                               #_(transact-csv db-atom
-                                                               #_food-file-name
-                                                               "temp/food-sample"
-                                                               (comp (take 100)
-                                                                     (map (partial-right prepare food-key-specification))))
+;; pId                     nCalls        Min      50% ≤      90% ≤      95% ≤      99% ≤        Max       Mean   MAD      Clock  Total
 
-                                               #_(let [food-id-set (set (map first (db-common/datoms-from @db-atom
-                                                                                                          :eav
-                                                                                                          [nil :category])))])
-                                               #_(transact-csv db-atom
-                                                               food-nutrient-file-name
-                                                               (comp (take 100)
-                                                                     (filter (fn [food-nutrient]
-                                                                               (contains? food-id-set
-                                                                                          (str "food-" (:fdc_id)))))
-                                                                     (map (partial-right prepare food-nutrient-key-specification))))
+;; :all                         1     3.82m      3.82m      3.82m      3.82m      3.82m      3.82m      3.82m    ±0%     3.82m    100%
+;; :next-sequence      92,245,824   102.00ns   228.00ns   370.00ns   461.00ns   673.00ns   245.95ms   816.83ns ±138%     1.26m     33%
+;; :tufte/compaction          115   105.28ms   194.37ms   252.53ms   259.94ms   450.19ms   476.16ms   194.87ms  ±25%    22.41s     10%
+;; :sequence-for-value     42,504     2.70μs    51.72μs    70.15μs    77.25μs   103.81μs   884.99ms   178.83μs ±142%     7.60s      3%
 
-                                               #_(transact-csv db-atom
-                                                               nutrient-file-name
-                                                               (comp (take 100)
-                                                                     (map (partial-right prepare nutrient-key-specification))))
+;; Accounted                                                                                                             5.58m    146%
+;; Clock                                                                                                                 3.82m    100%
 
 
-                                               db-atom))))))
+;; (def food-nutrient-index-definitions [db-common/eav-index-definition
+;;                                       (db-common/composite-index-definition :data-type-text
+;;                                                                             [:data-type
+;;                                                                              {:attributes [:name :description]
+;;                                                                               :value-function db-common/tokenize}])
+;;                                       (db-common/enumeration-index-definition :data-type :data-type)
+;;                                       (db-common/composite-index-definition :food-nutrient-amount [:food :nutrient :amount])
+;;                                       (db-common/composite-index-definition :nutrient-amount-food [:nutrient :amount :food])
+;;                                       ;; (db-common/rule-index-definition :datatype-nutrient-amount-food {:head [:?data-type :?nutrient :?amount :?food :?description]
+;;                                       ;;                                                                  :body [[:eav
+;;                                       ;;                                                                          [:?measurement :amount :?amount]
+;;                                       ;;                                                                          [:?measurement :nutrient :?nutrient]
+;;                                       ;;                                                                          [:?measurement :food :?food]
+;;                                       ;;                                                                          [:?food :data-type :?data-type]
+;;                                       ;;                                                                          [:?food :description :?description]]]})
+;;                                       ])
+;;
+;; #inst "2020-09-25T04:14:09.476-00:00" 500/35727 1% Indexing 500 entities took 1.716 seconds. 3.432 milliseconds per entity. 2 minutes remaining.
+;; #inst "2020-09-25T04:14:12.944-00:00" 1000/35727 2% Indexing 500 entities took 3.416 seconds. 6.832 milliseconds per entity. 3 minutes remaining.
+;; #inst "2020-09-25T04:14:19.625-00:00" 1500/35727 4% Indexing 500 entities took 6.612 seconds. 13.224 milliseconds per entity. 7 minutes remaining.
+;; #inst "2020-09-25T04:14:26.267-00:00" 2000/35727 5% Indexing 500 entities took 6.538 seconds. 13.076 milliseconds per entity. 7 minutes remaining.
+;; #inst "2020-09-25T04:14:34.525-00:00" 2500/35727 6% Indexing 500 entities took 8.153 seconds. 16.306 milliseconds per entity. 9 minutes remaining.
+;; #inst "2020-09-25T04:14:46.599-00:00" 3000/35727 8% Indexing 500 entities took 11.932 seconds. 23.864 milliseconds per entity. 13 minutes remaining.
+;; #inst "2020-09-25T04:14:57.073-00:00" 3500/35727 9% Indexing 500 entities took 10.316 seconds. 20.632 milliseconds per entity. 11 minutes remaining.
+;; #inst "2020-09-25T04:15:08.032-00:00" 4000/35727 11% Indexing 500 entities took 10.777 seconds. 21.554 milliseconds per entity. 11 minutes remaining.
+;; #inst "2020-09-25T04:15:19.821-00:00" 4500/35727 12% Indexing 500 entities took 11.607 seconds. 23.214 milliseconds per entity. 12 minutes remaining.
+;; #inst "2020-09-25T04:15:31.930-00:00" 5000/35727 13% Indexing 500 entities took 11.851 seconds. 23.702 milliseconds per entity. 12 minutes remaining.
+;; #inst "2020-09-25T04:15:46.501-00:00" 5500/35727 15% Indexing 500 entities took 14.374 seconds. 28.748 milliseconds per entity. 14 minutes remaining.
+;; #inst "2020-09-25T04:16:03.886-00:00" 6000/35727 16% Indexing 500 entities took 17.169 seconds. 34.338 milliseconds per entity. 17 minutes remaining.
+;; #inst "2020-09-25T04:16:19.466-00:00" 6500/35727 18% Indexing 500 entities took 15.301 seconds. 30.602 milliseconds per entity. 14 minutes remaining.
+;; #inst "2020-09-25T04:16:33.760-00:00" 7000/35727 19% Indexing 500 entities took 14.065 seconds. 28.13 milliseconds per entity. 13 minutes remaining.
+;; #inst "2020-09-25T04:16:49.682-00:00" 7500/35727 20% Indexing 500 entities took 15.681 seconds. 31.362 milliseconds per entity. 14 minutes remaining.
+;; #inst "2020-09-25T04:17:05.300-00:00" 8000/35727 22% Indexing 500 entities took 15.36 seconds. 30.72 milliseconds per entity. 14 minutes remaining.
+;; #inst "2020-09-25T04:17:22.559-00:00" 8500/35727 23% Indexing 500 entities took 16.949 seconds. 33.898 milliseconds per entity. 15 minutes remaining.
+;; #inst "2020-09-25T04:17:39.510-00:00" 9000/35727 25% Indexing 500 entities took 16.668 seconds. 33.336 milliseconds per entity. 14 minutes remaining.
+;; #inst "2020-09-25T04:17:45.540-00:00" 9500/35727 26% Indexing 500 entities took 5.748 seconds. 11.496 milliseconds per entity. 5 minutes remaining.
+;; #inst "2020-09-25T04:17:54.216-00:00" 10000/35727 27% Indexing 500 entities took 8.522 seconds. 17.044 milliseconds per entity. 7 minutes remaining.
+;; #inst "2020-09-25T04:18:00.973-00:00" 10500/35727 29% Indexing 500 entities took 6.599 seconds. 13.198 milliseconds per entity. 5 minutes remaining.
+;; #inst "2020-09-25T04:18:08.680-00:00" 11000/35727 30% Indexing 500 entities took 7.567 seconds. 15.134 milliseconds per entity. 6 minutes remaining.
+;; #inst "2020-09-25T04:18:15.224-00:00" 11500/35727 32% Indexing 500 entities took 6.401 seconds. 12.802 milliseconds per entity. 5 minutes remaining.
+;; #inst "2020-09-25T04:18:24.954-00:00" 12000/35727 33% Indexing 500 entities took 9.559 seconds. 19.118 milliseconds per entity. 7 minutes remaining.
+;; #inst "2020-09-25T04:18:34.407-00:00" 12500/35727 34% Indexing 500 entities took 9.223 seconds. 18.446 milliseconds per entity. 7 minutes remaining.
+;; #inst "2020-09-25T04:18:44.158-00:00" 13000/35727 36% Indexing 500 entities took 9.54 seconds. 19.08 milliseconds per entity. 7 minutes remaining.
+;; #inst "2020-09-25T04:18:55.350-00:00" 13500/35727 37% Indexing 500 entities took 10.98 seconds. 21.96 milliseconds per entity. 8 minutes remaining.
+;; #inst "2020-09-25T04:19:07.060-00:00" 14000/35727 39% Indexing 500 entities took 11.475 seconds. 22.95 milliseconds per entity. 8 minutes remaining.
+;; #inst "2020-09-25T04:19:19.066-00:00" 14500/35727 40% Indexing 500 entities took 11.72 seconds. 23.44 milliseconds per entity. 8 minutes remaining.
+;; #inst "2020-09-25T04:19:33.247-00:00" 15000/35727 41% Indexing 500 entities took 13.917 seconds. 27.834 milliseconds per entity. 9 minutes remaining.
+;; #inst "2020-09-25T04:19:47.825-00:00" 15500/35727 43% Indexing 500 entities took 14.306 seconds. 28.612 milliseconds per entity. 9 minutes remaining.
+;; #inst "2020-09-25T04:19:55.727-00:00" 16000/35727 44% Indexing 500 entities took 7.629 seconds. 15.258 milliseconds per entity. 5 minutes remaining.
+;; #inst "2020-09-25T04:20:10.349-00:00" 16500/35727 46% Indexing 500 entities took 14.458 seconds. 28.916 milliseconds per entity. 9 minutes remaining.
+;; #inst "2020-09-25T04:20:29.310-00:00" 17000/35727 47% Indexing 500 entities took 18.61 seconds. 37.22 milliseconds per entity. 11 minutes remaining.
+;; #inst "2020-09-25T04:20:45.682-00:00" 17500/35727 48% Indexing 500 entities took 16.02 seconds. 32.04 milliseconds per entity. 9 minutes remaining.
+;; #inst "2020-09-25T04:21:02.615-00:00" 18000/35727 50% Indexing 500 entities took 16.587 seconds. 33.174 milliseconds per entity. 9 minutes remaining.
+;; #inst "2020-09-25T04:21:21.784-00:00" 18500/35727 51% Indexing 500 entities took 18.821 seconds. 37.642 milliseconds per entity. 10 minutes remaining.
+;; #inst "2020-09-25T04:21:41.243-00:00" 19000/35727 53% Indexing 500 entities took 19.025 seconds. 38.05 milliseconds per entity. 10 minutes remaining.
+;; #inst "2020-09-25T04:22:02.431-00:00" 19500/35727 54% Indexing 500 entities took 20.785 seconds. 41.57 milliseconds per entity. 11 minutes remaining.
+;; #inst "2020-09-25T04:22:21.956-00:00" 20000/35727 55% Indexing 500 entities took 19.146 seconds. 38.292 milliseconds per entity. 10 minutes remaining.
+;; #inst "2020-09-25T04:22:44.432-00:00" 20500/35727 57% Indexing 500 entities took 22.089 seconds. 44.178 milliseconds per entity. 11 minutes remaining.
+;; #inst "2020-09-25T04:23:10.891-00:00" 21000/35727 58% Indexing 500 entities took 25.902 seconds. 51.804 milliseconds per entity. 12 minutes remaining.
+;; #inst "2020-09-25T04:23:39.088-00:00" 21500/35727 60% Indexing 500 entities took 27.718 seconds. 55.436 milliseconds per entity. 13 minutes remaining.
+;; #inst "2020-09-25T04:24:04.445-00:00" 22000/35727 61% Indexing 500 entities took 24.849 seconds. 49.698 milliseconds per entity. 11 minutes remaining.
+;; #inst "2020-09-25T04:24:37.428-00:00" 22500/35727 62% Indexing 500 entities took 32.537 seconds. 65.074 milliseconds per entity. 14 minutes remaining.
+;; #inst "2020-09-25T04:25:07.046-00:00" 23000/35727 64% Indexing 500 entities took 29.063 seconds. 58.126 milliseconds per entity. 12 minutes remaining.
+;; #inst "2020-09-25T04:25:36.792-00:00" 23500/35727 65% Indexing 500 entities took 29.09 seconds. 58.18 milliseconds per entity. 11 minutes remaining.
+;; #inst "2020-09-25T04:26:02.504-00:00" 24000/35727 67% Indexing 500 entities took 25.056 seconds. 50.112 milliseconds per entity. 9 minutes remaining.
+;; #inst "2020-09-25T04:26:26.428-00:00" 24500/35727 68% Indexing 500 entities took 23.385 seconds. 46.77 milliseconds per entity. 8 minutes remaining.
+;; #inst "2020-09-25T04:26:53.303-00:00" 25000/35727 69% Indexing 500 entities took 26.336 seconds. 52.672 milliseconds per entity. 9 minutes remaining.
+;; #inst "2020-09-25T04:27:21.291-00:00" 25500/35727 71% Indexing 500 entities took 27.443 seconds. 54.886 milliseconds per entity. 9 minutes remaining.
+;; #inst "2020-09-25T04:27:48.975-00:00" 26000/35727 72% Indexing 500 entities took 27.027 seconds. 54.054 milliseconds per entity. 8 minutes remaining.
+;; #inst "2020-09-25T04:28:27.861-00:00" 26500/35727 74% Indexing 500 entities took 38.303 seconds. 76.606 milliseconds per entity. 11 minutes remaining.
+;; #inst "2020-09-25T04:29:06.054-00:00" 27000/35727 75% Indexing 500 entities took 37.497 seconds. 74.994 milliseconds per entity. 10 minutes remaining.
+;; Execution error (NoSuchFileException) at sun.nio.fs.UnixException/translateToIOException (UnixException.java:86).
+;; temp/food_nutrient/data-type-text/metadata/E875BF763A999202972009ED48038220914FB55E92975B29AF19BD37C7240825
 
-(defn sample-indexes [db-atom]
-  (for [index-key (keys (:indexes @db-atom))]
-    [index-key (take 1 (db-common/propositions-from-index (db-common/index @db-atom index-key)
-                                                          ::comparator/min
-                                                          nil))]))
+
+(def food-nutrient-index-definitions [db-common/eav-index-definition
+                                      (db-common/composite-index-definition :data-type-text
+                                                                            [:data-type
+                                                                             {:attributes [:name :description]
+                                                                              :value-function db-common/tokenize}])
+                                      (db-common/enumeration-index-definition :data-type :data-type)
+                                      (db-common/composite-index-definition :food-nutrient-amount [:food :nutrient :amount])
+                                      (db-common/composite-index-definition :nutrient-amount-food [:nutrient :amount :food])
+                                      ;; (db-common/rule-index-definition :datatype-nutrient-amount-food {:head [:?data-type :?nutrient :?amount :?food :?description]
+                                      ;;                                                                  :body [[:eav
+                                      ;;                                                                          [:?measurement :amount :?amount]
+                                      ;;                                                                          [:?measurement :nutrient :?nutrient]
+                                      ;;                                                                          [:?measurement :food :?food]
+                                      ;;                                                                          [:?food :data-type :?data-type]
+                                      ;;                                                                          [:?food :description :?description]]]})
+                                      ])
+
+(defn create-food-db [path]
+  (atom #_(create-in-memory-db food-nutrient-index-definitions)
+        (create-db path food-nutrient-index-definitions)))
+
+(defn reset-db []
+  (def count-atom (atom 0))
+  (fs/delete-dir "temp/db")
+  (fs/mkdirs "temp/db")
+  (def db-atom (atom (create-food-db "temp/db")))
+  nil)
+
+(defn load-data-to-db [running?-atom]
+  (time (def db-atom (try (tufte/profile {}
+                                         (tufte/p :all
+                                                  (let [path "temp/food_nutrient"
+                                                        #_(reset-directory path)
+                                                        db-atom (atom #_(create-in-memory-db food-nutrient-index-definitions
+                                                                                             #_[db-common/eav-index-definition
+                                                                                                (db-common/enumeration-index-definition :data-type :data-type)])
+                                                                      (create-db path food-nutrient-index-definitions))]
+
+                                                    #_(transact-data-file db-atom
+                                                                        non-branded-foods-file-name
+                                                                        #_(comp (drop 29000)
+                                                                              (take-while (fn [_value] @running?-atom)))
+                                                                        #_identity
+                                                                        #_(take 3000)
+                                                                        food-key-specification
+                                                                        35727)
+                                                    #_(transact-data-file db-atom
+                                                                          #_non-branded-food-nutrient-file-name
+                                                                          non-branded-food-nutrient-sample-file-name
+                                                                          (take 4000)
+                                                                          food-nutrient-key-specification
+                                                                          1304201)
+
+                                                    #_(transact-csv db-atom
+                                                                    #_food-file-name
+                                                                    "temp/food-sample"
+                                                                    (comp (take 100)
+                                                                          (map (partial-right prepare food-key-specification))))
+
+                                                    #_(let [food-id-set (set (map first (db-common/datoms-from @db-atom
+                                                                                                               :eav
+                                                                                                               [nil :category])))])
+                                                    #_(transact-csv db-atom
+                                                                    food-nutrient-file-name
+                                                                    (comp (take 100)
+                                                                          (filter (fn [food-nutrient]
+                                                                                    (contains? food-id-set
+                                                                                               (str "food-" (:fdc_id)))))
+                                                                          (map (partial-right prepare food-nutrient-key-specification))))
+
+                                                    #_(transact-csv db-atom
+                                                                    nutrient-file-name
+                                                                    (comp (take 100)
+                                                                          (map (partial-right prepare nutrient-key-specification))))
+
+
+                                                    db-atom)))
+                          (catch Exception e
+                            (prn (Throwable->map e)))))))
+
+
+(defn load-btree [root-node-id directory-storage]
+  {:id root-node-id
+   :children (for [child-id (:child-ids (btree/get-node-content directory-storage
+                                                                root-node-id))]
+               (load-btree child-id directory-storage))})
 (comment
 
-  (def my-future (future (load-data-to-db)
+  (def running?-atom (atom true))
+  (reset! running?-atom false)
+  (def my-future (future (load-data-to-db running?-atom)
                          (println "done")))
+
+  (:val @my-future)
 
   ;; #inst "2020-09-12T04:16:39.144-00:00" 500/35727 1% Indexing 500 entities took 0.519 seconds. 1.038 milliseconds per entity. 0 minutes remaining.
   ;; #inst "2020-09-12T04:16:39.879-00:00" 1000/35727 2% Indexing 500 entities took 0.7 seconds. 1.4 milliseconds per entity. 0 minutes remaining.
@@ -623,23 +738,24 @@
                                                                              (:data_type food))))))))
 
   (def non-branded-food-id-set (into #{}
-                                     (comp (take 1000)
+                                     (comp (take 3000)
                                            (map :fdc_id))
                                      (serialization/file-reducible non-branded-foods-file-name)))
 
   (count non-branded-food-id-set)
   (take 10 non-branded-food-id-set)
 
-
   ;; non branded food-nutrients
 
 
   (def writing-future (future (write-csv-rows-to-data-file food-nutrient-file-name
                                                            ;; non-branded-food-nutrient-file-name
-                                                           non-branded-food-nutrient-sample-file-name
+                                                           non-branded-food-nutrient-sample-3000-file-name
                                                            (filter (fn [food-nutrient]
                                                                      (contains? non-branded-food-id-set
                                                                                 (:fdc_id food-nutrient)))))))
+
+
   (serialization/transduce-file non-branded-food-nutrient-file-name
                                 :initial-value 0
                                 :reducer (completing (fn [count item_]
@@ -647,7 +763,14 @@
 
   (into []
         (take 10)
-        (serialization/file-reducible non-branded-food-nutrient-file-name))
+        (serialization/file-reducible ;; non-branded-food-nutrient-file-name
+         non-branded-food-nutrient-sample-3000-file-name))
+
+  (net.cgrand.xforms/count identity
+                           (serialization/file-reducible
+                            #_non-branded-food-nutrient-file-name
+                            non-branded-food-nutrient-sample-file-name
+                            #_non-branded-food-nutrient-sample-3000-file-name))
 
   (realized? writing-future)
 
@@ -666,8 +789,8 @@
   (into []
         (take 100)
         (db-common/datoms-from @db-atom
-                               ;; :data-type
-                               :food-nutrient-amount
+                                :data-type
+                               ;; :food-nutrient-amount
                                ;; :eav
                                []))
 
@@ -723,6 +846,22 @@
 
   (storage/get-edn-from-storage! (directory-storage/create "temp/food_nutrient/food-nutrient/nodes")
                                  "2972C6C9818042859708646AAE63EE7DD8674F50918052FA361D91FDC8F3951F")
+
+  (load-btree "D177932C2D5E2E9E3EF3076D96D5DFB8B39243E169C54D9409987E11784F5C09"
+              (directory-storage/create "temp/food_nutrient/data-type-text/metadata"))
+
+  (def node-content (time (btree/get-node-content (directory-storage/create "temp/food_nutrient/data-type-text/nodes")
+                                                  "F5F4B444990B5AB08FC01D61EC32DC064BBE0E8918326B5DE794D833C026EE81")))
+  (count (:values  node-content))
+  (take 10 (:values  node-content))
+
+  (storage/get-edn-from-storage! (directory-storage/create "temp/food_nutrient/data-type-text/metadata")
+                                 #_"FF6AC77E4B0A0BDA5645C5985AE314FB60306ADD1F138F156A811A263767C168"
+                                 "D177932C2D5E2E9E3EF3076D96D5DFB8B39243E169C54D9409987E11784F5C09"
+                                 #_"roots")
+
+  (storage/get-from-storage! (directory-storage/create "temp/food_nutrient/data-type-text/metadata")
+                             "roots3")
 
   (let [db-atom (atom (create-in-memory-db food-nutrient-index-definitions))]
     (transact-csv db-atom
