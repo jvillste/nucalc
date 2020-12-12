@@ -2,7 +2,6 @@
   (:require [argumentica.btree-index :as btree-index]
             [argumentica.mutable-collection :as mutable-collection]
             [argumentica.db.file-transaction-log :as file-transaction-log]
-            [argumentica.csv :as csv]
             [clojure.java.io :as io]
             [argumentica.btree :as btree]
             [argumentica.btree-db :as btree-db]
@@ -17,6 +16,7 @@
             [argumentica.sorted-set-index :as sorted-set-index]
             [argumentica.storage :as storage]
             [argumentica.transaction-log :as transaction-log]
+            [argumentica.reduction :as reduction]
             [clojure.set :as set]
             [clojure.string :as string]
             [clojure.test :as t :refer :all]
@@ -41,7 +41,10 @@
             [argumentica.db.query :as query]
             [argumentica.node-serialization :as node-serialization]
             [argumentica.sorted-reducible :as sorted-reducible]
-            [argumentica.db.multifile-transaction-log :as multifile-transaction-log])
+            [argumentica.db.multifile-transaction-log :as multifile-transaction-log]
+            [nucalc.csv :as nucalc-csv]
+            [argumentica.util :as util]
+            [net.cgrand.xforms :as xforms])
   (:gen-class))
 
 (defn filter-by-attributes [attributes-set index-definition]
@@ -62,13 +65,17 @@
                         []))
    :datom-transaction-number-index 2})
 
+(defn create-transaction-log [directory-path]
+  (fs/mkdirs directory-path)
+  (multifile-transaction-log/open directory-path))
+
 (defn create-db [path index-definitions]
   (db-common/db-from-index-definitions index-definitions
                                        (fn [index-key]
                                          (btree-collection/create-on-disk (str path "/" (name index-key))
                                                                           {:node-size 10001}))
                                        (do (fs/mkdirs (str path "/transaction-log"))
-                                           (multifile-transaction-log/create (str path "/transaction-log")))))
+                                           (multifile-transaction-log/open (str path "/transaction-log")))))
 
 (defn create-in-memory-db [index-definitions]
   (db-common/db-from-index-definitions index-definitions
@@ -187,6 +194,13 @@
   (transaction-log/make-persistent! (:transaction-log db))
   nil)
 
+(defn- clean-up-after-indexing [db]
+  (-> db
+      (btree-db/store-index-roots-after-maximum-number-of-transactions 0)
+      (btree-db/unload-nodes 200)
+      (btree-db/remove-old-roots)
+      (btree-db/collect-storage-garbage)))
+
 (defn- finish-batch [state-atom batch-size entity-count db-atom]
   (let [elapsed-time (- (System/currentTimeMillis)
                         (:last-batch-ended @state-atom))]
@@ -210,12 +224,7 @@
 
   (when (instance? argumentica.btree_collection.BtreeCollection
                    (-> @db-atom :indexes vals first :collection))
-    (swap! db-atom (fn [db]
-                     (-> db
-                         (btree-db/store-index-roots-after-maximum-number-of-transactions 0)
-                         (btree-db/unload-nodes 200)
-                         (btree-db/remove-old-roots)
-                         (btree-db/collect-storage-garbage)))))
+    (swap! db-atom clean-up-after-indexing))
 
   (swap! state-atom assoc :last-batch-ended (System/currentTimeMillis)))
 
@@ -238,10 +247,6 @@
                        batch-size))
            (finish-batch state-atom batch-size entity-count db-atom))
          (rf result input))))))
-
-(comment
-  (transduce batching-transducer conj [1 2 3])
-  ) ;; TODO: remove-me
 
 
 (def food-csv-rows-to-maps (csv-rows-to-maps :parse-value (comp empty-string-to-nil
@@ -296,12 +301,14 @@
                [id-key]))))
 
 (defn make-reference-id-key [map key new-key prefix]
-  (assoc map new-key (str prefix (key map))))
+  (-> map
+      (assoc new-key (str prefix (key map)))
+      (dissoc key)))
 
 (defn add-type [type a-map]
   (assoc a-map :type type))
 
-(defn make-id-keys [map key-specification]
+(defn make-id-keys [key-specification map]
   (reduce (fn [map reference-key]
             (make-reference-id-key map
                                    (:key reference-key)
@@ -311,14 +318,25 @@
                        key-specification)
           (:reference-keys key-specification)))
 
+(deftest test-make-id-keys
+  (is (= {:dali/id "thing-1"
+          :other-thing "other-thing-2"}
+         (make-id-keys {:id-key :id
+                        :prefix "thing-"
+                        :reference-keys [{:key :other-thing-id
+                                          :new-key :other-thing
+                                          :prefix "other-thing-"}]}
+                       {:id 1
+                        :other-thing-id 2}))))
+
 (defn keys-to-kebab-case [a-map]
   (medley/map-keys camel-snake-kebab/->kebab-case-keyword
                    a-map))
 
 (defn prepare [a-map key-specification]
-  (-> a-map
-      (keys-to-kebab-case)
-      (make-id-keys key-specification)))
+  (->> a-map
+       (keys-to-kebab-case)
+       (make-id-keys)))
 
 (def food-key-specification {:id-key :fdc-id
                              :prefix "food-"
@@ -516,19 +534,20 @@
   ) ;; TODO: remove-me
 
 (def food-nutrient-index-definitions [db-common/eav-index-definition
-                                      (db-common/composite-index-definition :text
-                                                                            [{:attributes [:name :description]
-                                                                              :value-function db-common/tokenize}])
-                                      (db-common/enumeration-index-definition :data-type :data-type)
-                                      (db-common/composite-index-definition :food-nutrient-amount [:food :nutrient :amount])
-                                      (db-common/composite-index-definition :nutrient-amount-food [:nutrient :amount :food])
-                                      (db-common/rule-index-definition :datatype-nutrient-amount-food {:head [:?data-type :?nutrient :?amount :?food :?description]
-                                                                                                       :body [[:eav
-                                                                                                               [:?measurement :amount :?amount]
-                                                                                                               [:?measurement :nutrient :?nutrient]
-                                                                                                               [:?measurement :food :?food]
-                                                                                                               [:?food :data-type :?data-type]
-                                                                                                               [:?food :description :?description]]]})])
+                                      ;; (db-common/composite-index-definition :text
+                                      ;;                                       [{:attributes [:name :description]
+                                      ;;                                         :value-function db-common/tokenize}])
+                                      ;; (db-common/enumeration-index-definition :data-type :data-type)
+                                      ;; (db-common/composite-index-definition :food-nutrient-amount [:food :nutrient :amount])
+                                      ;; (db-common/composite-index-definition :nutrient-amount-food [:nutrient :amount :food])
+                                      ;; (db-common/rule-index-definition :datatype-nutrient-amount-food {:head [:?data-type :?nutrient :?amount :?food :?description]
+                                      ;;                                                                  :body [[:eav
+                                      ;;                                                                          [:?measurement :amount :?amount]
+                                      ;;                                                                          [:?measurement :nutrient :?nutrient]
+                                      ;;                                                                          [:?measurement :food :?food]
+                                      ;;                                                                          [:?food :data-type :?data-type]
+                                      ;;                                                                          [:?food :description :?description]]]})
+                                      ])
 
 (defn create-food-db [path]
   (atom #_(create-in-memory-db food-nutrient-index-definitions)
@@ -597,16 +616,16 @@
                                                                                                 (db-common/enumeration-index-definition :data-type :data-type)])
                                                                       (create-db path food-nutrient-index-definitions))]
 
-                                                    (transact-csv db-atom
-                                                                  nutrient-file-name
-                                                                  (map (partial-right prepare nutrient-key-specification)))
+                                                    #_(transact-csv db-atom
+                                                                    nutrient-file-name
+                                                                    (map (partial-right prepare nutrient-key-specification)))
 
                                                     (transact-data-file db-atom
                                                                         non-branded-foods-file-name
                                                                         #_(comp (drop 29000)
                                                                                 (take-while (fn [_value] @running?-atom)))
                                                                         #_identity
-                                                                        (take 1502)
+                                                                        (take 5000)
                                                                         food-key-specification
                                                                         35727)
 
@@ -652,15 +671,327 @@
 
 ;;TODO: (load-data-to-db running?-atom) does not work
 
+(defn write-to-btree [])
+
+(defn latest-root-metadata [btree-collection]
+  (->> btree-collection
+       btree-collection/btree
+       btree/roots-2
+       btree/latest-of-roots
+       :metadata))
+
+(defn count-inputs
+  ([] 0)
+  ([result] result)
+  ([result _input]
+   (inc result)))
+
+(defn write-batch-to-btree-collection! [reducible batch-size entity-to-rows btree-collection]
+  (let [first-input-number (inc (or (:last-input-number (latest-root-metadata btree-collection))
+                                    -1))
+        input-count (transduce (comp (drop (inc first-input-number))
+                                     (take batch-size)
+                                     (reduction/report-progress-every-n-seconds 1
+                                                                                (reduction/handle-batch-ending-by-printing-report "\n"
+                                                                                                                                  batch-size))
+                                     (map (fn [entity]
+                                            (run! (partial mutable-collection/add! btree-collection)
+                                                  (entity-to-rows entity))
+                                            entity)))
+                               count-inputs
+                               reducible)]
+
+    (btree-collection/locking-apply-to-btree! btree-collection
+                                              btree/store-root-2
+                                              {:last-input-number (+ first-input-number input-count)})
+
+    ;; (btree-collection/locking-apply-to-btree! btree-collection
+    ;;                                           btree/remove-old-roots-2)
+
+    ;; (btree-collection/locking-apply-to-btree! btree-collection
+    ;;                                           btree/collect-storage-garbage)
+    nil))
+
 (comment
-  (def db-atom (common/deref (create-db "/Users/jukka/google-drive/src/nucalc/temp/food_nutrient copy"
-                                        #_db-path food-nutrient-index-definitions)))
+  (transduce identity
+             count-inputs
+             (range 3))
+
+  (reduce count-inputs
+          0
+          (range 3))
+
+  (def transaction-log-path "temp/test-transaction-log")
+  (fs/mkdirs transaction-log-path)
+
+  (def foods-path "temp/test-foods")
+  (do (fs/delete-dir foods-path)
+      (fs/mkdirs foods-path))
+
+  (def full-text-path "temp/test-full-text")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  ;; print 5 lines from the CSV file
+
+  (reduction/process! (nucalc-csv/line-reducible (io/reader food-file-name))
+                      (take 5)
+                      (map println))
+
+  ;; parse first 5 lines to vectors
+
+  (into []
+        (take 5)
+        (nucalc-csv/vector-reducible (io/reader food-file-name)))
+
+
+  ;; parse first 5 lines to hash maps
+
+  (into []
+        (comp (nucalc-csv/csv-rows-to-maps)
+              (take 5))
+        (nucalc-csv/csv-reducible (io/reader food-file-name)))
+
+
+  ;; an index definition as a function from an entity to index rows
+
+  (defn food-to-full-text-index-rows [food]
+    (for [token (map string/lower-case
+                     (string/split (:description food)
+                                   #" "))]
+      [token (:fdc-id food)]))
+
+  (deftest test-food-to-rows
+    (is (= '(["tutturosso" "344604"]
+             ["green" "344604"]
+             ["14.5oz." "344604"]
+             ["nsa" "344604"]
+             ["italian" "344604"]
+             ["diced" "344604"]
+             ["tomatoes" "344604"])
+           (food-to-full-text-index-rows {:fdc-id "344604",
+                                          :data-type "branded_food",
+                                          :description "Tutturosso Green 14.5oz. NSA Italian Diced Tomatoes",
+                                          :food-category-id "",
+                                          :publication-date "2019-04-01"}))))
+
+
+
+  ;; write a full text index as a b-tree on disk
+
+  (do (fs/delete-dir full-text-path)
+      (fs/mkdirs full-text-path))
+
+  (write-batch-to-btree-collection! (nucalc-csv/hashmap-reducible-from-csv (io/reader food-file-name))
+                                    1000
+                                    food-to-full-text-index-rows
+                                    (btree-collection/create-on-disk full-text-path
+                                                                     {:node-size 5000}))
+
+
+
+  ;; read 50 first foods that contain "tomatoes" in the description
+
+  (into []
+        (take 50)
+        (sorted-reducible/subreducible (btree-collection/create-on-disk full-text-path)
+                                       ["tomatoes"]))
+
+
+
+
+
+  ;; progress reporting transducer
+
+  (transduce (reduction/report-progress-every-n-seconds 1
+                                                        #(prn %)
+                                                        #_(reduction/handle-batch-ending-by-printing-report "\nTest"
+                                                                                                          15))
+             (completing (fn [_result _value]
+                           (Thread/sleep (rand 300))
+                           nil))
+             nil
+             (range 10))
+
+
+
+  (into []
+        (comp (report-progress-every-n-seconds 1
+                                               (handle-batch-ending-by-printing-report "\nTest"
+                                                                                       15))
+              (map (fn [_input]
+                     (Thread/sleep (rand 300))
+                     nil)))
+        (range 10))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+  (let [btree-collection (btree-collection/create-on-disk foods-path
+                                                          {:node-size 1000})]
+    (write-batch-to-btree-collection! (nucalc-csv/hashmap-reducible-from-csv (io/reader food-file-name))
+                                      30
+                                      (fn [{:keys [fdc-id data-type food-category-id description]}]
+                                        [[fdc-id data-type food-category-id description]])
+                                      btree-collection))
+
+
+  (let [btree-collection (btree-collection/create-on-disk full-text-path
+                                                          {:node-size 1000})]
+
+    (reduction/process! (nucalc-csv/hashmap-reducible-from-csv (io/reader food-file-name))
+                        (comp (drop 10)
+                              (take 10))
+                        (map (fn [food]
+                               (run! (partial mutable-collection/add! btree-collection)
+                                     (for [token (string/split (or (:description food)
+                                                                   "")
+                                                               #" ")]
+                                       [(string/lower-case token) (:fdc-id food)])))))
+
+    (btree-collection/locking-apply-to-btree! btree-collection
+                                              btree/store-root-2 {:last-row-number 19}))
+
+  (let [btree-collection (btree-collection/create-on-disk full-text-path
+                                                          {:node-size 1000})]
+
+    (latest-root-metadata btree-collection)
+
+    #_(into []
+            (take 4)
+            (sorted-reducible/subreducible btree-collection ["tomatoes"])))
+
+  (let [btree-collection (btree-collection/create-on-disk foods-path
+                                                          {:node-size 1000})]
+
+    (into []
+          (take 2)
+          (sorted-reducible/subreducible btree-collection)))
+
+  (let [btree-collection (btree-collection/create-on-disk foods-path
+                                                          {:node-size 1000})]
+
+    (reduce reduction/first-value
+            (sorted-reducible/subreducible btree-collection ["344606"])))
+
+
+  (into []
+        (comp (take 10)
+              (map (partial make-id-keys food-key-specification))
+              (map map-to-transaction/map-to-statements))
+        (nucalc-csv/hashmap-reducible-from-csv (io/reader food-file-name)))
+
+
+  (def count-atom (atom 0))
+  (def logging-future (future (with-open [transaction-log (multifile-transaction-log/create transaction-log-path)]
+                                (reduction/process! (nucalc-csv/hashmap-reducible-from-csv (io/reader food-file-name))
+                                                    (map (fn [hash-map]
+                                                           (update! count-atom inc)
+                                                           (transaction-log/add! transaction-log hash-map)))))))
+
+  (with-open [transaction-log (multifile-transaction-log/create transaction-log-path)]
+    (reduction/process! (nucalc-csv/hashmap-reducible-from-csv (io/reader food-file-name))
+                        (take 10)
+                        (map (partial make-id-keys food-key-specification))
+                        (map map-to-transaction/map-to-statements)
+                        (map (fn [statements]
+                               (transaction-log/add! transaction-log statements)))))
+
+  (with-open [transaction-log (multifile-transaction-log/create transaction-log-path)]
+    (into [] (transaction-log/subreducible transaction-log 0)))
+
+  (with-open [transaction-log (multifile-transaction-log/create transaction-log-path)]
+    (let [btree-collection (btree-collection/create-on-disk foods-path
+                                                            {:node-size 1000})]
+
+      (reduction/process! (transaction-log/subreducible transaction-log 0)
+                          (map (fn [statements]
+                                 (run! (partial mutable-collection/add! btree-collection)
+                                       (remove nil? (for [[o e a v] statements]
+                                                      (when (= :description a)
+                                                        (for [token (string/split v #" ")]
+                                                          [a (string/lower-case token) e]))))))))
+
+      (into [] (sorted-reducible/subreducible btree-collection #_["food-344607"]))))
+
+
+  (multifile-transaction-log/create transaction-log-path)
+
+  (def db-atom (atom (common/deref (create-db "/Users/jukka/google-drive/src/nucalc/temp/food_nutrient"
+                                              #_db-path food-nutrient-index-definitions))))
+
+  (keys (:indexes @db-atom))
+
+  (common/first-unindexed-transaction-number @db-atom)
+
+  (type db-atom)
+
+  (swap! db-atom common/update-indexes)
+  (do (swap! db-atom clean-up-after-indexing)
+      nil)
+
+  (into []
+        (take 10)
+        (db-common/datoms-from @db-atom
+                               :eav
+                               ;; :text
+                               ;; :data-type
+                               ;; :food-nutrient-amount
+                               ;; :nutrient-amount-food
+                               ;; :datatype-nutrient-amount-food
+
+                               []))
+
   (transaction-log/last-transaction-number (:transaction-log @db-atom))
+
   (:last-transaction-number @db-atom)
   (reset! running?-atom false)
   (reset! running?-atom true)
   (def my-future (future (load-data-to-db running?-atom)
                          (println "done")))
+
+
 
   (:val @my-future)
 
@@ -723,17 +1054,7 @@
   (keys (:indexes @db-atom))
   ;; => (:eav :data-type :food-nutrient-amount :nutrient-amount-food)
 
-  (into []
-        (take 100)
-        (db-common/datoms-from @db-atom
-                               #_ :data-type
-                               ;; :food-nutrient-amount
-                               #_:eav
-                               #_:data-type-text
-                               :datatype-nutrient-amount-food
-                               #_:nutrient-amount-food
-                               []
-                               #_["food-nutrient"]))
+
 
 
 
@@ -777,6 +1098,9 @@
                        #_(map (partial-right prepare food-nutrient-key-specification)))
                  :reducer conj)
 
+  (storage/get-edn-from-storage! (directory-storage/create "temp/food_nutrient/eav")
+                                 "roots")
+
   (storage/get-edn-from-storage! (directory-storage/create "temp/food_nutrient/data-type-text/metadata")
                                  "roots")
   (storage/get-edn-from-storage! (directory-storage/create "temp/food_nutrient/data-type-text/metadata")
@@ -808,7 +1132,7 @@
     (transact-csv db-atom
                   food-nutrient-file-name
                   (comp (take 10)
-                        (map (partial-right make-id-keys food-nutrient-key-specification))
+                        (map (partial make-id-keys food-nutrient-key-specification))
                         (map (partial add-type :nutrient-amount-food))))
     (swap! db-atom
            db-common/transact
@@ -822,7 +1146,7 @@
       :indexes :food-nutrient-amount)
 
   (-> (atom (create-in-memory-db food-nutrient-index-definitions))
-      (transact-with-transducer (map (partial-right make-id-keys food-nutrient-key-specification))
+      (transact-with-transducer (map (partial make-id-keys food-nutrient-key-specification))
                                 food-nutrient-sample)
       (swap! db-common/transact
              #{[["food-nutrient" [1 1]] :amount :set 3]})
@@ -958,7 +1282,7 @@
 
   (transduce-csv food-file-name
                  (comp (csv-rows-to-maps :parse-value parse-number)
-                       (map (partial-right make-id-keys food-key-specification))
+                       (map (partial make-id-keys food-key-specification))
                        (take 100))
                  :reducer conj)
 
@@ -969,13 +1293,13 @@
                                    (= 0 (:amount food-nutrient))
                                    #_(= "" (:data_points food-nutrient))))
                        (take 100)
-                       #_(map (partial-right make-id-keys food-nutrient-key-specification)))
+                       #_(map (partial make-id-keys food-nutrient-key-specification)))
                  :reducer conj)
 
   (transduce-csv nutrient-file-name
                  (comp (take 10)
                        (csv-rows-to-maps :parse-value parse-number)
-                       (map (partial-right make-id-keys nutrient-key-specification)))
+                       (map (partial make-id-keys nutrient-key-specification)))
                  :reducer conj)
 
   @count-atom
@@ -1025,7 +1349,7 @@
 
   (->> non-branded-foods
        (take 2)
-       (map (partial-right
+       (map (partial
              make-id-keys
              food-key-specification))
        (map map-to-transaction/maps-to-transaction)
@@ -1038,8 +1362,8 @@
                                   (transduce (comp (take 3000)
                                                    (map (fn [entity]
                                                           (swap! count-atom inc)
-                                                          (map-to-transaction/maps-to-transaction (make-id-keys entity
-                                                                                                                food-key-specification))))
+                                                          (map-to-transaction/maps-to-transaction (make-id-keys food-key-specification
+                                                                                                                entity))))
                                                    (map (fn [transaction]
                                                           (swap! db-atom db-common/transact transaction)))
                                                    (map (fn [_]
@@ -1049,11 +1373,11 @@
   @count-atom
   @db-atom
 
-  (map-to-transaction/maps-to-transaction ((partial-right make-id-keys food-key-specification) {:fdc_id 321506,
-                                                                                                :data_type "sample_food",
-                                                                                                :description "BEANS, SNAP, CANNED, DRAINED, DEL MONTE",
-                                                                                                :food_category_id 11,
-                                                                                                :publication_date "2019-04-01"}))
+  (map-to-transaction/maps-to-transaction ((partial make-id-keys food-key-specification) {:fdc_id 321506,
+                                                                                          :data_type "sample_food",
+                                                                                          :description "BEANS, SNAP, CANNED, DRAINED, DEL MONTE",
+                                                                                          :food_category_id 11,
+                                                                                          :publication_date "2019-04-01"}))
 
   (def food-nutrient (read-csv "/Users/jukka/Downloads/FoodData_Central_csv_2019-12-17/food_nutrient.csv"))
 
@@ -1078,6 +1402,8 @@
 
   ;; TODO: remove-me
   )
+
+
 
 (defn entity [id]
   (db-common/->Entity (db-common/deref @db-atom)
