@@ -44,7 +44,8 @@
             [argumentica.db.multifile-transaction-log :as multifile-transaction-log]
             [nucalc.csv :as nucalc-csv]
             [argumentica.util :as util]
-            [net.cgrand.xforms :as xforms])
+            [net.cgrand.xforms :as xforms]
+            [argumentica.leaf-node-serialization :as leaf-node-serialization])
   (:gen-class))
 
 (defn filter-by-attributes [attributes-set index-definition]
@@ -667,6 +668,11 @@
                                                                 root-node-id))]
                (load-btree child-id directory-storage))})
 
+(defn load-btree-2 [storage-key directory-storage]
+  {:storage-key storage-key
+   :children (for [child-storage-key (map :storage-key (:children (btree/load-node-data directory-storage
+                                                                                        storage-key)))]
+               (load-btree-2 child-storage-key directory-storage))})
 (defonce running?-atom (atom true))
 
 ;;TODO: (load-data-to-db running?-atom) does not work
@@ -680,44 +686,94 @@
        btree/latest-of-roots
        :metadata))
 
-(defn count-inputs
-  ([] 0)
-  ([result] result)
-  ([result _input]
-   (inc result)))
+#_(defn write-batch-to-btree-collection! [reducible batch-size entity-to-rows btree-collection]
+    (let [first-input-number (inc (or (:last-input-number (latest-root-metadata btree-collection))
+                                      -1))
+          input-count (transduce (comp (drop (inc first-input-number))
+                                       (take batch-size)
+                                       (reduction/report-progress-every-n-seconds 1
+                                                                                  (reduction/handle-batch-ending-by-printing-report "\n"
+                                                                                                                                    batch-size))
+                                       (map (fn [entity]
+                                              (run! (partial mutable-collection/add! btree-collection)
+                                                    (entity-to-rows entity))
+                                              entity)))
+                                 count-inputs
+                                 reducible)]
 
-(defn write-batch-to-btree-collection! [reducible batch-size entity-to-rows btree-collection]
-  (let [first-input-number (inc (or (:last-input-number (latest-root-metadata btree-collection))
-                                    -1))
-        input-count (transduce (comp (drop (inc first-input-number))
-                                     (take batch-size)
-                                     (reduction/report-progress-every-n-seconds 1
-                                                                                (reduction/handle-batch-ending-by-printing-report "\n"
-                                                                                                                                  batch-size))
-                                     (map (fn [entity]
-                                            (run! (partial mutable-collection/add! btree-collection)
-                                                  (entity-to-rows entity))
-                                            entity)))
-                               count-inputs
-                               reducible)]
+      (btree-collection/locking-apply-to-btree! btree-collection
+                                                btree/store-root-2
+                                                {:last-input-number (+ first-input-number input-count)})
 
-    (btree-collection/locking-apply-to-btree! btree-collection
-                                              btree/store-root-2
-                                              {:last-input-number (+ first-input-number input-count)})
+      ;; (btree-collection/locking-apply-to-btree! btree-collection
+      ;;                                           btree/remove-old-roots-2)
 
-    ;; (btree-collection/locking-apply-to-btree! btree-collection
-    ;;                                           btree/remove-old-roots-2)
+      ;; (btree-collection/locking-apply-to-btree! btree-collection
+      ;;                                           btree/collect-storage-garbage)
+      nil))
 
-    ;; (btree-collection/locking-apply-to-btree! btree-collection
-    ;;                                           btree/collect-storage-garbage)
-    nil))
+(defn recreate-directory [path]
+  (fs/delete-dir path)
+  (fs/mkdirs path)
+  path)
+
+(defn write-batches-to-btree-collection! [reducible batch-size total-count value-to-rows node-size btree-path]
+  (let [run?-atom (atom true)]
+    (future (let [btree-collection (btree-collection/create-on-disk btree-path
+                                                                    {:node-size node-size})
+                  first-input-number (inc (or (:last-input-number (latest-root-metadata btree-collection))
+                                              -1))
+                  input-count-atom (atom 0)
+                  finish-batch (fn []
+                                 (println "writing root")
+                                 (btree-collection/locking-apply-to-btree! btree-collection
+                                                                           (fn [btree]
+                                                                             (-> btree
+                                                                                 (btree/store-root-2 {:last-input-number (+ first-input-number
+                                                                                                                            @input-count-atom)})
+                                                                                 btree/remove-old-roots-2
+                                                                                 btree/collect-storage-garbage))))]
+              (transduce (comp (reduction/report-progress-every-n-seconds 5
+                                                                          (reduction/handle-batch-ending-by-printing-report (str "\n" btree-path)
+                                                                                                                            total-count))
+                               (drop (inc first-input-number))
+                               (reduction/run-every-nth batch-size finish-batch)
+                               (reduction/run-while-true run?-atom)
+                               (map (fn [entity]
+                                      (run! (partial mutable-collection/add! btree-collection)
+                                            (value-to-rows entity))
+                                      (swap! input-count-atom inc)
+                                      entity)))
+                         reduction/count-inputs
+                         reducible)
+              (finish-batch)))
+    run?-atom))
+
+(defn food-to-row [food]
+  [((juxt :fdc-id
+          :description
+          :data-type
+          :food-category-id)
+    food)])
+
+(deftest test-food-to-row
+  (is (= [["344604"
+           "Tutturosso Green 14.5oz. NSA Italian Diced Tomatoes"
+           "branded_food"
+           ""]]
+         (food-to-row {:fdc-id "344604",
+                       :data-type "branded_food",
+                       :description "Tutturosso Green 14.5oz. NSA Italian Diced Tomatoes",
+                       :food-category-id "",
+                       :publication-date "2019-04-01"}))))
+
 
 (comment
   (transduce identity
-             count-inputs
+             reduction/count-inputs
              (range 3))
 
-  (reduce count-inputs
+  (reduce reduction/count-inputs
           0
           (range 3))
 
@@ -786,7 +842,7 @@
     (for [token (map string/lower-case
                      (string/split (:description food)
                                    #" "))]
-      [token (:fdc-id food)]))
+      [token (:data-type food) (:fdc-id food)]))
 
   (deftest test-food-to-rows
     (is (= '(["tutturosso" "344604"]
@@ -803,26 +859,92 @@
                                           :publication-date "2019-04-01"}))))
 
 
-
   ;; write a full text index as a b-tree on disk
+  (def full-text-path "temp/test-full-text")
+  (recreate-directory full-text-path)
 
-  (do (fs/delete-dir full-text-path)
-      (fs/mkdirs full-text-path))
+  (def full-text-run?-atom (write-batches-to-btree-collection! (eduction (take 15000)
+                                                                         (nucalc-csv/hashmap-reducible-from-csv (io/reader food-file-name)))
+                                                               5000
+                                                               390294
+                                                               food-to-full-text-index-rows
+                                                               10000
+                                                               full-text-path))
 
-  (write-batch-to-btree-collection! (nucalc-csv/hashmap-reducible-from-csv (io/reader food-file-name))
-                                    1000
-                                    food-to-full-text-index-rows
-                                    (btree-collection/create-on-disk full-text-path
-                                                                     {:node-size 5000}))
+  ;; full text
+  ;; Progress:                                 100.0% (390292/390294)
+  ;; Processing time of the latest batch:      0:0:4.1
+  ;; Processed values per second:              57
+  ;; Total time passed:                        0:22:10.0
+  ;; Remaining time based on the latest batch: 0:0:0.0
+  ;; Remaining time based on total progress:   0:0:0.0
 
 
+  (reset! full-text-run?-atom false)
+
+  (let [query-word "potato"]
+    (time (into []
+                (comp (take-while (fn [[word]]
+                                    (.startsWith word query-word)))
+
+                      #_(remove (fn [[_word data-type]]
+                                  (= "branded_food" data-type)))
+                      (take 1))
+                (sorted-reducible/subreducible (btree-collection/create-on-disk full-text-path)
+                                               [query-word]))))
+
+  (btree/collect-storage-garbage (btree-collection/btree (btree-collection/create-on-disk full-text-path)))
+
+  (def foods-path "temp/foods")
+  (recreate-directory foods-path)
+  (def foods-run?-atom (write-batches-to-btree-collection! (nucalc-csv/hashmap-reducible-from-csv (io/reader food-file-name))
+                                                           50000
+                                                           390294
+                                                           food-to-row
+                                                           5000
+                                                           foods-path))
+
+  ;; temp/foods
+  ;; Progress:                                 100.0% (390292/390294)
+  ;; Processing time of the latest batch:      0:0:2.3
+  ;; Processed values per second:              993
+  ;; Total time passed:                        0:2:41.3
+  ;; Remaining time based on the latest batch: 0:0:0.0
+  ;; Remaining time based on total progress:   0:0:0.0
+
+  (reset! foods-run?-atom false)
+
+  (time (into []
+              (take 10)
+              (sorted-reducible/subreducible (btree-collection/create-on-disk foods-path)
+                                             ["170379"])))
+
+
+
+
+  (def data-types-path "temp/data-types")
+  (recreate-directory data-types-path)
+  (def data-types-run?-atom (write-batches-to-btree-collection! (nucalc-csv/hashmap-reducible-from-csv (io/reader food-file-name))
+                                                                50000
+                                                                390294
+                                                                (fn [food]
+                                                                  [(:data-type food)])
+                                                                5000
+                                                                data-types-path))
+
+
+  (time (into []
+              (sorted-reducible/subreducible (btree-collection/create-on-disk data-types-path))))
+
+
+
+
+  (btree/roots-2 (btree-collection/btree (btree-collection/create-on-disk full-text-path
+                                                                          {:node-size 10000})))
 
   ;; read 50 first foods that contain "tomatoes" in the description
 
-  (into []
-        (take 50)
-        (sorted-reducible/subreducible (btree-collection/create-on-disk full-text-path)
-                                       ["tomatoes"]))
+
 
 
 
@@ -831,27 +953,14 @@
   ;; progress reporting transducer
 
   (transduce (reduction/report-progress-every-n-seconds 1
-                                                        #(prn %)
-                                                        #_(reduction/handle-batch-ending-by-printing-report "\nTest"
+                                                        ;;#(prn %)
+                                                        (reduction/handle-batch-ending-by-printing-report "\nTest"
                                                                                                           15))
              (completing (fn [_result _value]
                            (Thread/sleep (rand 300))
                            nil))
              nil
-             (range 10))
-
-
-
-  (into []
-        (comp (report-progress-every-n-seconds 1
-                                               (handle-batch-ending-by-printing-report "\nTest"
-                                                                                       15))
-              (map (fn [_input]
-                     (Thread/sleep (rand 300))
-                     nil)))
-        (range 10))
-
-
+             (range 15))
 
 
 
@@ -1100,6 +1209,33 @@
 
   (storage/get-edn-from-storage! (directory-storage/create "temp/food_nutrient/eav")
                                  "roots")
+
+  (storage/get-edn-from-storage! (directory-storage/create "temp/test-full-text")
+                                 "roots")
+
+  (storage/get-edn-from-storage! (directory-storage/create "temp/test-full-text")
+                                 "7C1C69D7B9BBBF4CD148FAD8E9E032AAAC463D1959B3D5A4961CF92326DA7B68")
+
+  (def storage-key "1DB84A2B6C0056CAB23A288B238DA7F6740DD82CD6A3E9ADD38F93F8AB92FD97")
+
+  (node-serialization/deserialize-metadata (storage/stream-from-storage! (directory-storage/create "temp/test-full-text")
+                                                                         storage-key))
+
+  (time (into [] (take 1) (leaf-node-serialization/reducible ["coconut"]
+                                                             :forwards
+                                                             (:values (node-serialization/deserialize (storage/stream-from-storage! (directory-storage/create "temp/test-full-text")
+                                                                                                                                    storage-key))))))
+
+  (node-serialization/deserialize-metadata (storage/stream-from-storage! (directory-storage/create "temp/test-full-text")
+                                                                         "989C4D015D5F8A6CF62E8C553F1B2A1ACDD04EDB1013B63B6876388CC6F5EDFE"))
+
+
+
+  (load-btree-2 (:storage-key (first (storage/get-edn-from-storage! (directory-storage/create "temp/test-full-text")
+                                                                    "roots")))
+                (directory-storage/create "temp/test-full-text"))
+
+
 
   (storage/get-edn-from-storage! (directory-storage/create "temp/food_nutrient/data-type-text/metadata")
                                  "roots")
@@ -1433,6 +1569,7 @@
 
 (defn -main [& arguments]
   (println "moi"))
+
 (defn dezerialize-node [directory-path node-key]
   (with-open [input-stream (storage/stream-from-storage! (directory-storage/create directory-path)
                                                          node-key)]
@@ -1481,13 +1618,4 @@
 
   (dezerialize-node test-btree-path "00DFB6802F5EA99212DFF6762BD4C9EFC327BBBB4040AEF789F3785CB8297668")
   (dezerialize-node test-btree-path "E04F9045E3E4E378808CA0785A23CB3C78EF6E974EA7A78B86355287BB9565E4")
-
-
-
-
-
-
-
-
-
   ) ;; TODO: remove-me
