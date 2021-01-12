@@ -27,8 +27,17 @@
             (data-csv/read-csv reader))
     (finally (.close reader))))
 
+(defn reduce-csv-file [file-name reducing-function initial-value]
+  (with-open [reader (io/reader file-name)]
+    (reduce reducing-function
+            initial-value
+            (data-csv/read-csv reader))))
+
 (defn vector-reducible [reader]
   (reduction/reducible (partial reduce-csv reader)))
+
+(defn vector-reducible-for-file-name [file-name]
+  (reduction/reducible (partial reduce-csv-file file-name)))
 
 (def csv-rows-to-maps-options {(schema/optional-key :value-function) fn?
                                (schema/optional-key :key-function) fn?})
@@ -64,10 +73,18 @@
                                               {:value-function read-string
                                                :key-function identity})))))
 
+(util/defno hashmap-reducible-for-csv-file [file-name options :- csv-rows-to-maps-options]
+  (eduction (csv-rows-to-maps options)
+            (vector-reducible-for-file-name file-name)))
+
 (comment
 
   (into []
         (take 10)
         (hashmap-reducible-from-csv (io/reader "/Users/jukka/Documents/FoodData_Central_csv_2020-04-29/food.csv")))
+
+   (into []
+        (take 10)
+        (hashmap-reducible-for-csv-file (io/reader "/Users/jukka/Documents/FoodData_Central_csv_2020-04-29/food.csv")))
 
   )

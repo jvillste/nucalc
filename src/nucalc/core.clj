@@ -512,14 +512,15 @@
 
 (defn write-csv-rows-to-data-file [csv-file-name output-file-name transducer]
   (let [total-count (reduce reduction/count-inputs (nucalc-csv/line-reducible (io/reader csv-file-name)))]
+    (println "total count is" total-count)
     (serialization/with-data-output-stream output-file-name
       (fn [data-output-stream]
         (reduction/process! (nucalc-csv/hashmap-reducible-from-csv (io/reader csv-file-name)
                                                                    {:value-function parse-number})
-                            transducer
                             (reduction/report-progress-every-n-seconds 5
                                                                        (reduction/handle-batch-ending-by-printing-report (str "\n" csv-file-name " -> " output-file-name)
                                                                                                                          total-count))
+                            transducer
                             (partition-all 500)
                             (map #(serialization/write-to-data-output-stream data-output-stream %))))))
   (println "writing ready."))
@@ -737,14 +738,24 @@
   ) ;; TODO: remove-me
 
 (defn write-batches-to-btree-collection! [reducible total-count value-to-rows node-size btree-path]
-  (let [run?-atom (atom true)]
-    (future (try (let [btree-collection (btree-collection/create-on-disk btree-path
-                                                                         {:node-size node-size})
+  (println "Starting writing.")
+  (println "btree path:" btree-path)
+  (println "node size:" node-size)
+
+  (let [start-time (System/currentTimeMillis)
+        run?-atom (atom true)]
+    (future (try (let [btree-collection (-> (btree-collection/create-on-disk btree-path
+                                                                             {:node-size node-size})
+                                            (btree-collection/locking-apply-to-btree! btree/make-transient))
                        first-input-number (inc (or (:last-input-number (latest-root-metadata btree-collection))
                                                    -1))
                        input-count-atom (atom 0)
                        finish-batch (fn [_input-count]
+                                      (println "used time in seconds" (float (/ (- (System/currentTimeMillis)
+                                                                                   start-time)
+                                                                                1000)))
                                       (println "writing root")
+
                                       (btree-collection/locking-apply-to-btree! btree-collection
                                                                                 (fn [btree]
                                                                                   (-> btree
@@ -767,9 +778,9 @@
                                            entity)))
                               reduction/count-inputs
                               reducible)
-                   (println "finishing due to user request")
-                   #_(finish-batch)
-                   (println "all batches done."))
+                   (btree-collection/locking-apply-to-btree! btree-collection
+                                                             btree/make-persistent!)
+                   (println "finished writing"))
                  (catch Exception e
                    (prn e))))
     run?-atom))
@@ -778,20 +789,35 @@
   (let [values (into []
                      (take 1000)
                      reducible)]
-    (/ (count (node-serialization/serialize {:values (mapcat value-to-rows values)}))
-       (count values))))
+    (int (/ (count (node-serialization/serialize {:values (mapcat value-to-rows values)}))
+            (count values)))))
+
+(deftest test-bytes-per-value
+  (is (= 5
+         (bytes-per-value vector (range 1000)))))
+(comment
+  (->> (range 10)
+       (map (fn [number]
+              (.limit (clojure.data.fressian/write number))))
+       (reduce +))
+  (count (node-serialization/serialize {:values (range 20)}))
+  (count (node-serialization/with-data-output-stream
+           (fn [data-output-stream]
+             (node-serialization/write-rows (range 10)
+                                            data-output-stream))))
+
+  (type (node-serialization/serialize {:values (range 1000)}))
+  (.limit (clojure.data.fressian/write 1000))
+  )
+
 
 (defn write-batches-to-btree-collection2! [reducible value-to-rows btree-path]
   (write-batches-to-btree-collection! reducible
                                       (reduce reduction/count-inputs 0 reducible)
                                       value-to-rows
-                                      (/ 300000
-                                         (bytes-per-value value-to-rows reducible))
+                                      (quot 600000
+                                            (bytes-per-value value-to-rows reducible))
                                       btree-path))
-
-(comment
-  (reduce + (eduction (take 3) (range 10)))
-  ) ;; TODO: remove-me
 
 (defn food-to-row [food]
   [((juxt :fdc-id
@@ -827,18 +853,56 @@
                 column-keys
                 reducible))
 
-(defn btree-reducible [btree-path pattern]
-  (let [keys (edn/read (java.io.PushbackReader. (io/reader (str btree-path "/metadata/keys"))))]
-    (eduction (comp (take-while (fn [row]
-                                  (or (empty? pattern)
-                                      (= (take (count pattern)
-                                               row)
-                                         pattern))))
-                    (map (fn [row]
-                           (into {} (map vector keys row)))))
-              (sorted-reducible/subreducible (btree-collection/create-on-disk btree-path)
-                                             (or pattern
-                                                 ::comparator/min)))))
+(defn- full-text-rows [text-column-keys other-column-keys value]
+  (for [token (->> text-column-keys
+                   (select-keys value)
+                   vals
+                   (string/join " ")
+                   db-common/tokenize
+                   distinct)]
+    (into [token]
+          ((apply juxt other-column-keys) value))))
+
+(deftest test-full-text-rows
+  (is (= (["this" 123 "this is description"]
+          ["is" 123 "this is description"]
+          ["description" 123 "this is description"]
+          ["title" 123 "this is description"])
+         (full-text-rows [:description :title]
+                         [:id :description]
+                         {:description "this is description"
+                          :title "this is title"
+                          :id 123}))))
+
+(defn create-full-text-btree [directory-path text-column-keys other-column-keys reducible]
+  (create-btree directory-path
+                (partial full-text-rows text-column-keys other-column-keys)
+                (concat [:token] other-column-keys)
+                reducible))
+
+(defn btree-keys [btree-path]
+  (edn/read (java.io.PushbackReader. (io/reader (str btree-path "/metadata/keys")))))
+
+(defn rows-to-maps [keys]
+  (map (fn [row]
+         (into {} (map vector keys row)))))
+
+(defn open-btree [btree-path]
+  (assoc (btree-collection/create-on-disk btree-path)
+         :keys (btree-keys btree-path)))
+
+(defn btree-subreducible [btree pattern]
+  (eduction (rows-to-maps (:keys btree))
+            (sorted-reducible/subreducible btree
+                                           (or pattern
+                                               ::comparator/min))))
+
+(defn btree-matching-subreducible [btree pattern]
+  (eduction (comp (db-common/take-while-pattern-matches pattern)
+                  (rows-to-maps (:keys btree)))
+            (sorted-reducible/subreducible btree
+                                           (or pattern
+                                               ::comparator/min))))
 
 (comment
   (transduce identity
@@ -948,26 +1012,41 @@
                                                          40000
                                                          full-text-path)))
 
+  (def run?-atom (create-btree "temp/food-token-data-type-id"
+                               (fn [food]
+                                 (for [token (db-common/tokenize (:description food))]
+                                   [token
+                                    (:data-type food)
+                                    (:fdc-id food)]))
+                               [:token :data-type :fdc-id]
+                               (serialization/file-reducible non-branded-foods-file-name)))
+
+  (into [] (eduction (take 10) (serialization/file-reducible non-branded-foods-file-name)))
+  (into [] (take 10) (btree-reducible "temp/non-branded-foods-full-text" []))
 
   (let [directory-path "temp/non-branded-foods-full-text"]
     (do (recreate-directory directory-path)
         (def run?-atom (write-batches-to-btree-collection2! (serialization/file-reducible non-branded-foods-file-name)
                                                             (fn [food]
-                                                              (for [token (map string/lower-case
-                                                                               (string/split (:description food)
-                                                                                             #" "))]
+                                                              (for [token (db-common/tokenize (:description food))]
                                                                 [token
                                                                  (:data-type food)
                                                                  (:fdc-id food)]))
                                                             directory-path))))
 
-  (def run?-atom (create-projection-btree "temp/descriptions2"
+  (def run?-atom (create-projection-btree "temp/fdc-id-data-type-description"
                                           [:fdc-id :data-type :description]
-                                          #_(serialization/file-reducible non-branded-foods-file-name)
-                                          (eduction (take 10)
-                                                    (serialization/file-reducible non-branded-foods-file-name))))
+                                          (serialization/file-reducible non-branded-foods-file-name)))1
 
-  (into [] (take 10) (btree-reducible "temp/descriptions2" [344611]))
+  write-batches-to-btree-collection!
+  (reset! run?-atom false)
+  (into [] (take 10) (btree-matching-subreducible (open-btree "temp/descriptions")
+                                                  [344611]))
+
+  (into []
+        (take 10)
+        (btree-subreducible (open-btree "temp/descriptions")
+                            [344611]))
 
   #_(into [] (eduction (take 10)
                        (serialization/file-reducible non-branded-foods-file-name)))
@@ -985,30 +1064,83 @@
                                                            40000
                                                            directory-path))))
 
+  (def run?-atom (create-projection-btree "temp/nutrients"
+                                          [:id
+                                           :name
+                                           :unit-name
+                                           :nutrient-nbr
+                                           :rank]
+                                          (nucalc-csv/hashmap-reducible-for-csv-file nutrient-file-name
+                                                                                     {:value-function parse-number})))
 
-  (let [directory-path "temp/measurements"]
-    (do (recreate-directory directory-path)
-        (def run?-atom (write-batches-to-btree-collection! (serialization/file-reducible non-branded-food-nutrient-file-name)
-                                                           #_(eduction (take 10) (serialization/file-reducible non-branded-food-nutrient-file-name))
-                                                           500000
-                                                           1304201
-                                                           (fn [food-nutrient]
-                                                             [((juxt :id
-                                                                     :fdc_id
-                                                                     :nutrient_id
 
-                                                                     :amount
-                                                                     :min
-                                                                     :max
-                                                                     :median
+  (let [btree (open-btree "temp/nutrients")]
+    (into [] (take 1000) (btree-reducible btree [1004])))
 
-                                                                     :data_points
-                                                                     :derivation_id
-                                                                     :min_year_acquired
-                                                                     :footnote)
-                                                               food-nutrient)])
-                                                           40000
-                                                           directory-path))))
+  (into [] (take 1000) (btree-reducible "temp/nutrients" [1004]))
+
+  (into [] (take 1000) (btree-reducible "temp/nutrients" nil))
+
+  (into [] (take 1000) (nucalc-csv/hashmap-reducible-from-csv (io/reader nutrient-file-name)
+                                                              {:value-function parse-number}))
+
+
+  (def run?-atom (create-projection-btree "temp/measurements"
+                                          [:id
+                                           :fdc-id
+                                           :nutrient-id
+
+                                           :amount
+                                           :min
+                                           :max
+                                           :median
+
+                                           :data-points
+                                           :derivation-id
+                                           :min-year-acquired
+                                           :footnote]
+                                          (serialization/file-reducible non-branded-food-nutrient-file-name)
+                                          #_(eduction (take 2) (serialization/file-reducible non-branded-food-nutrient-file-name))))
+
+  (into [] (eduction (take 2) (serialization/file-reducible non-branded-food-nutrient-file-name)))
+
+
+
+  (into [] (take 10) (btree-reducible "temp/measurements" [9070977]))
+
+  #_(let [directory-path "temp/measurements"]
+      (do (recreate-directory directory-path)
+          (def run?-atom (write-batches-to-btree-collection! (serialization/file-reducible non-branded-food-nutrient-file-name)
+                                                             #_(eduction (take 10) (serialization/file-reducible non-branded-food-nutrient-file-name))
+                                                             500000
+                                                             1304201
+                                                             (fn [food-nutrient]
+                                                               [((juxt :id
+                                                                       :fdc_id
+                                                                       :nutrient_id
+
+                                                                       :amount
+                                                                       :min
+                                                                       :max
+                                                                       :median
+
+                                                                       :data_points
+                                                                       :derivation_id
+                                                                       :min_year_acquired
+                                                                       :footnote)
+                                                                 food-nutrient)])
+                                                             40000
+                                                             directory-path))))
+
+  (def run?-atom (create-projection-btree "temp/food-nutrient-amount"
+                                          [:fdc-id
+                                           :nutrient-id
+                                           :amount
+                                           :id]
+                                          (serialization/file-reducible non-branded-food-nutrient-file-name)
+                                          #_(eduction (take 2) (serialization/file-reducible non-branded-food-nutrient-file-name))))
+
+  (into [] (take 10) (btree-reducible "temp/food-nutrient-amount" []))
 
   (let [directory-path "temp/food-to-measurements"]
     (do (recreate-directory directory-path)
@@ -1039,6 +1171,34 @@
                                                                food-nutrient)])
                                                            40000
                                                            directory-path))))
+
+  (def run?-atom (create-full-text-btree "temp/nutrients-by-token"
+                                         [:name]
+                                         [:id
+                                          :name
+                                          :unit-name
+                                          :nutrient-nbr
+                                          :rank]
+                                         (nucalc-csv/hashmap-reducible-for-csv-file nutrient-file-name
+                                                                                    {:value-function parse-number})))
+
+  (defn btree-first-matching [btree pattern]
+    (reduction/first-from-reducible (btree-matching-subreducible btree pattern)))
+
+  (into [] (take 10) (btree-subreducible (open-btree "temp/nutrients-by-token")
+                                         ["carb"]))
+
+  (btree-first-matching (open-btree "temp/nutrients-by-token")
+                        ["carbohydrate"])
+
+
+  (def run?-atom (create-projection-btree "temp/data-types"
+                                          [:data-type]
+                                          (serialization/file-reducible non-branded-foods-file-name)))
+
+  (into [] (take 10) (btree-subreducible (open-btree "temp/data-types")
+                                         []))
+
 
   ;; full text
   ;; Progress:                                 100.0% (390292/390294)
@@ -1309,7 +1469,7 @@
                                                            non-branded-foods-file-name
                                                            (filter (fn [food]
                                                                      (not (= "branded_food"
-                                                                             (:data_type food))))))))
+                                                                             (:data-type food))))))))
 
   (def non-branded-food-id-set (into #{}
                                      (comp #_(take 3000)
@@ -1833,4 +1993,48 @@
 
   (dezerialize-node test-btree-path "00DFB6802F5EA99212DFF6762BD4C9EFC327BBBB4040AEF789F3785CB8297668")
   (dezerialize-node test-btree-path "E04F9045E3E4E378808CA0785A23CB3C78EF6E974EA7A78B86355287BB9565E4")
+  ) ;; TODO: remove-me
+
+(defn test-query []
+  (let [food-nutrient-amount-btree (open-btree "temp/food-nutrient-amount")
+        food-token-data-type-id-btree (open-btree "temp/food-token-data-type-id")
+        nutrient-id-name-unit-name-nutrient-nbr-rank (open-btree "temp/nutrients")
+        fdc-id-data-type-description (open-btree "temp/fdc-id-data-type-description")]
+
+    (tufte/profile {}
+                   (tufte/p :all
+                            (into []
+                                  (take 1)
+                                  (query/reducible-query nil
+                                                         [food-token-data-type-id-btree
+                                                          ["beans" :?data-type :?food]
+                                                          ["kidney" :?data-type :?food]]
+                                                         [food-nutrient-amount-btree
+                                                          [:?food 1005 :?amount]]
+                                                         [fdc-id-data-type-description
+                                                          [:?food :* #_:?data-type-2 :?description]]))))
+    #_(time (let [nutrient-id 1005]
+              (println (:name (btree-first-matching nutrient-id-name-unit-name-nutrient-nbr-rank
+                                                    [1005])))
+              (reduction/process! (btree-matching-subreducible food-token-data-type-id-btree ["bean"])
+                                  (remove (fn [food]
+                                            (= "sample_food"
+                                               (:data-type food))))
+                                  (take 20)
+                                  (map (fn [food]
+                                         (println (:amount (btree-first-matching food-nutrient-amount-btree
+                                                                                 [(:fdc-id food)]))
+                                                  (:data-type food)
+                                                  (:description (btree-first-matching fdc-id-data-type-description
+                                                                                      [(:fdc-id food)]))))))
+              #_(map #(dissoc % :storage-key) (btree/loaded-node-sizes (btree-collection/btree food-nutrient-amount-btree)))))))
+
+(comment
+  (test-query)
+  (map #(.startsWith % "xy") [ "x"])
+
+   (set! *warn-on-reflection* false)
+
+  (into [] (take 10) (btree-subreducible (open-btree "temp/data-types")
+                                         []))
   ) ;; TODO: remove-me
