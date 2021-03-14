@@ -1995,46 +1995,68 @@
   (dezerialize-node test-btree-path "E04F9045E3E4E378808CA0785A23CB3C78EF6E974EA7A78B86355287BB9565E4")
   ) ;; TODO: remove-me
 
-(defn test-query []
-  (let [food-nutrient-amount-btree (open-btree "temp/food-nutrient-amount")
-        food-token-data-type-id-btree (open-btree "temp/food-token-data-type-id")
-        nutrient-id-name-unit-name-nutrient-nbr-rank (open-btree "temp/nutrients")
-        fdc-id-data-type-description (open-btree "temp/fdc-id-data-type-description")]
 
-    (tufte/profile {}
-                   (tufte/p :all
-                            (into []
-                                  (take 1)
-                                  (query/reducible-query nil
-                                                         [food-token-data-type-id-btree
-                                                          ["beans" :?data-type :?food]
-                                                          ["kidney" :?data-type :?food]]
-                                                         [food-nutrient-amount-btree
-                                                          [:?food 1005 :?amount]]
-                                                         [fdc-id-data-type-description
-                                                          [:?food :* #_:?data-type-2 :?description]]))))
-    #_(time (let [nutrient-id 1005]
-              (println (:name (btree-first-matching nutrient-id-name-unit-name-nutrient-nbr-rank
-                                                    [1005])))
-              (reduction/process! (btree-matching-subreducible food-token-data-type-id-btree ["bean"])
-                                  (remove (fn [food]
-                                            (= "sample_food"
-                                               (:data-type food))))
-                                  (take 20)
-                                  (map (fn [food]
-                                         (println (:amount (btree-first-matching food-nutrient-amount-btree
-                                                                                 [(:fdc-id food)]))
-                                                  (:data-type food)
-                                                  (:description (btree-first-matching fdc-id-data-type-description
-                                                                                      [(:fdc-id food)]))))))
-              #_(map #(dissoc % :storage-key) (btree/loaded-node-sizes (btree-collection/btree food-nutrient-amount-btree)))))))
 
 (comment
   (test-query)
   (map #(.startsWith % "xy") [ "x"])
 
-   (set! *warn-on-reflection* false)
+  (set! *warn-on-reflection* false)
 
   (into [] (take 10) (btree-subreducible (open-btree "temp/data-types")
                                          []))
+
+  (into [] (take 10) (btree-subreducible (open-btree "temp/nutrients")
+                                         []))
+
+  #_(time (let [nutrient-id 1005]
+            (println (:name (btree-first-matching nutrient-id-name-unit-name-nutrient-nbr-rank
+                                                  [1005])))
+            (reduction/process! (btree-matching-subreducible food-token-data-type-id-btree ["bean"])
+                                (remove (fn [food]
+                                          (= "sample_food"
+                                             (:data-type food))))
+                                (take 20)
+                                (map (fn [food]
+                                       (println (:amount (btree-first-matching food-nutrient-amount-btree
+                                                                               [(:fdc-id food)]))
+                                                (:data-type food)
+                                                (:description (btree-first-matching fdc-id-data-type-description
+                                                                                    [(:fdc-id food)]))))))
+            #_(map #(dissoc % :storage-key) (btree/loaded-node-sizes (btree-collection/btree food-nutrient-amount-btree)))))
+
   ) ;; TODO: remove-me
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+(defn test-query []
+  (let [food-nutrient-amount-btree (open-btree "temp/food-nutrient-amount")
+        food-token-data-type-id-btree (open-btree "temp/food-token-data-type-id")
+        fdc-id-data-type-description (open-btree "temp/fdc-id-data-type-description")]
+    (into []
+          (take 100)
+          (query/reducible-query {:?food 169885}
+                                 [food-token-data-type-id-btree
+                                  ["kidney" :?data-type :?food]
+                                  ["beans" :?data-type :?food]]
+                                 [food-nutrient-amount-btree
+                                  [:?food 1005 :?amount]]
+                                 [fdc-id-data-type-description
+                                  [:?food :* :?description]]))))

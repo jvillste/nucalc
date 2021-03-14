@@ -11,7 +11,8 @@
                  [me.raynes/fs "1.4.6"]
                  [com.taoensso/nippy "2.13.0"]
                  [com.taoensso/tufte "2.1.0"]
-                 [net.cgrand/xforms "0.19.2"]]
+                 [net.cgrand/xforms "0.19.2"]
+                 [flow-gl/flow-gl "1.0.0-SNAPSHOT"]]
   :main nucalc.core
 ;;  :aot [nucalc.core]
   )
