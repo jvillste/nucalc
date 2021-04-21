@@ -846,14 +846,24 @@
                                        value-to-rows
                                        directory-path))
 
+(defn in-memory-index [row-function-specification values]
+  {:sorted (into (db-common/create-sorted-datom-set)
+                 (mapcat (:row-function row-function-specification)
+                         values))
+   :columns (:columns row-function-specification)})
+
+(defn projection [& columns]
+  {:columns columns
+   :row-function (fn [value]
+                   [((apply juxt columns) value)])})
+
 (defn create-projection-btree [directory-path column-keys reducible]
   (create-btree directory-path
-                (fn [value]
-                  [((apply juxt column-keys) value)])
+                (projection column-keys)
                 column-keys
                 reducible))
 
-(defn- full-text-rows [text-column-keys other-column-keys value]
+(defn full-text-rows [text-column-keys other-column-keys value]
   (for [token (->> text-column-keys
                    (select-keys value)
                    vals
@@ -873,6 +883,11 @@
                          {:description "this is description"
                           :title "this is title"
                           :id 123}))))
+
+(defn full-text [text-column-keys other-column-keys]
+  {:columns (concat [:token]
+                    other-column-keys)
+   :row-function (partial full-text-rows text-column-keys other-column-keys)})
 
 (defn create-full-text-btree [directory-path text-column-keys other-column-keys reducible]
   (create-btree directory-path
