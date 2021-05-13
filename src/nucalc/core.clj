@@ -903,18 +903,18 @@
          (into {} (map vector keys row)))))
 
 (defn open-btree [btree-path]
-  (assoc (btree-collection/create-on-disk btree-path)
-         :keys (btree-keys btree-path)))
+  {:sorted (btree-collection/create-on-disk btree-path)
+   :columns (btree-keys btree-path)})
 
 (defn btree-subreducible [btree pattern]
-  (eduction (rows-to-maps (:keys btree))
+  (eduction (rows-to-maps (:columns btree))
             (sorted-reducible/subreducible btree
                                            (or pattern
                                                ::comparator/min))))
 
 (defn btree-matching-subreducible [btree pattern]
   (eduction (comp (db-common/take-while-pattern-matches pattern)
-                  (rows-to-maps (:keys btree)))
+                  (rows-to-maps (:columns btree)))
             (sorted-reducible/subreducible btree
                                            (or pattern
                                                ::comparator/min))))

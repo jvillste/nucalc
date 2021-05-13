@@ -134,21 +134,10 @@
             (sorted-reducible/subreducible sorted-reducible
                                            [query-string])))
 
-(defn starts-with [string & [key]]
-  {:minimum-value string
-   :match (fn [value]
-            (string/starts-with? value string))
-   :key key})
-
-(defn equals [key value]
-  {:minimum-value value
-   :match (partial = value)
-   :key key})
-
 (defn find-food-3 [indexes tokens]
   (query/merge-join (concat (for [token tokens #_(take 1 (drop 0 tokens))]
                               {:sorted-reducible (:food-description-token-data-type-food indexes)
-                               :pattern [token #_(starts-with token)
+                               :pattern [token #_(query/starts-with token)
                                          "sr_legacy_food" #_:?data-type
                                          :?food]})
                             [{:sorted-reducible (:food-data-type-description indexes)
@@ -158,12 +147,12 @@
 (defn tokens-starting-with [food-description-token-data-type-food start-string]
   (map first
        (query/matching-unique-subsequence food-description-token-data-type-food
-                                          [(starts-with start-string :?token)])))
+                                          [(query/starts-with start-string :?token)])))
 
 (defn find-food-with-nested-loop-join [indexes tokens]
   (query/query-2 (into [(:food-description-token-data-type-food indexes)]
                        (for [token tokens]
-                         [(starts-with token)
+                         [(query/starts-with token)
                           :?data-type
                           :?food]))
                  [(:food-data-type-description indexes)
@@ -197,7 +186,7 @@
 (defn replace-pattern-prefix [prefix pattern]
   (concat (map (fn [prefix-value pattern-term]
                  (if (:key pattern-term)
-                   (equals (:key pattern-term) prefix-value)
+                   (query/equals (:key pattern-term) prefix-value)
                    prefix-value))
                prefix
                pattern)
@@ -208,7 +197,7 @@
   (is (= '(:a :b 3 4)
          (replace-pattern-prefix [:a :b] [1 2 3 4])))
 
-  #_(is (= [(equals :?first "aa")
+  #_(is (= [(query/equals :?first "aa")
             :b
             3
             4]
@@ -226,29 +215,41 @@
            pattern-prefixes))))
 
 (defn concat-merge-joins [participant-combinations]
-  (apply concat (map query/merge-join participant-combinations)))
+  (apply concat (map query/merge-join-selections participant-combinations)))
 
 (defn merge-join-with-prefixes [participants]
   (apply concat (map query/merge-join (selection-product participants))))
 
-(defn loop-join [index pattern substitutions]
-  (check-pattern! (:columns index) pattern)
-
-  (apply concat (for [substitution substitutions]
-                  (map (fn [new-substitution]
-                         (merge substitution new-substitution))
-                       (query/unique-substitutions (:sorted index)
-                                                   (query/substitute pattern substitution))))))
 
 (defn find-food-with-merge-join [indexes tokens]
-  (->> (selection-product (for [token tokens]
-                            {:sorted (:food-description-token-data-type-food indexes)
-                             :pattern [(starts-with token)
-                                       :?data-type
-                                       :?food]}))
-       (concat-merge-joins)
-       (loop-join (:food-data-type-description indexes)
-                  [:?food :?data-type :?description])))
+  (->> (for [token-combination (query/cartesian-product (for [query-string tokens]
+                                                          (map first
+                                                               (query/select-unique (:food-description-token-data-type-food indexes)
+                                                                                    [(query/starts-with query-string)]))))]
+         (query/merge-join (for [token token-combination]
+                             [(:food-description-token-data-type-food indexes)
+                              [#_(rename (query/equals :?token token)
+                                         {:token token})
+                               token
+                               :?data-type
+                               :?fdc-id]])))
+       (apply concat)
+       (distinct)
+       (query/loop-join (:food-data-type-description indexes)
+                        [:?fdc-id
+                         :?data-type
+                         :?description])
+       (query/variable-keys-to-keywords))
+
+  ;; (->> (selection-product (for [token tokens]
+  ;;                           {:sorted (:food-description-token-data-type-food indexes)
+  ;;                            :pattern [(query/starts-with token)
+  ;;                                      :?data-type
+  ;;                                      :?food]}))
+  ;;      (concat-merge-joins)
+  ;;      (query/loop-join (:food-data-type-description indexes)
+  ;;                       [:?food :?data-type :?description]))
+  )
 
 
 
@@ -266,102 +267,6 @@
                   (merge result substitution))
                 (query/merge-join (for [selection selections]
                                     (update selection :pattern #(query/substitute % substitution))))))))
-
-
-
-
-(defn sorted [indexes index-key]
-  (get-in indexes [index-key :sorted]))
-
-(defn term-name [term]
-  (cond (:original-key term)
-        (query/unconditional-variable-name (:original-key term))
-
-        (query/varialbe-key? term)
-        (query/unconditional-variable-name term)
-
-        (:key term)
-        (query/unconditional-variable-name (:key term))
-
-        :default
-        nil))
-
-(defn check-pattern! [columns pattern]
-  (when (< (count columns)
-           (count pattern))
-    (throw (ex-info "Pattern is too long" {})))
-
-  (loop [names (map name columns)
-         terms pattern]
-    (when-let [term (first terms)]
-      (if-let [term-name (term-name term)]
-        (if (= (first names)
-               term-name)
-          (recur (rest names)
-                 (rest terms))
-          (throw (ex-info "term name does not match column name" {:column-name (first names)
-                                                                  :term-name term-name})))
-        (recur (rest names)
-               (rest terms))))))
-
-(deftest test-check-pattern!
-  (is (nil? (check-pattern! [:a :b]
-                           [:?a :?b])))
-
-  (is (nil? (check-pattern! [:a :b]
-                           [:?a])))
-
-  (is (nil? (check-pattern! [:a :b]
-                           [{:original-key :?a}])))
-
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                        #"Pattern is too long"
-                        (check-pattern! [:a :b]
-                                       [:?a :?b :?c]))))
-
-(defn select-unique [index pattern]
-  (check-pattern! (:columns index) pattern)
-
-  (query/matching-unique-subsequence (:sorted index)
-                                     pattern))
-
-(defn select [index pattern]
-  (check-pattern! (:columns index) pattern)
-
-  (let [result-row-length (count pattern)]
-    (map (partial take result-row-length)
-         (query/matching-subsequence (:sorted index)
-                                     pattern))))
-
-(defn unify [index pattern]
-  (map #(query/unify % pattern)
-       (select index pattern)))
-
-(defn unify-unique [index pattern]
-  (map #(query/unify % pattern)
-       (select-unique index pattern)))
-
-(defn rename [original-key-or-term new-key]
-  (if (query/conditional-variable? original-key-or-term)
-    (assoc original-key-or-term
-           :original-key (:key original-key-or-term)
-           :key new-key)
-
-    {:original-key original-key-or-term
-     :key new-key}))
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 
@@ -418,9 +323,12 @@
      :measurements (nucalc/in-memory-index (nucalc/projection :food :nutrient :amount :id)
                                            measurements)}))
 
-(comment
+(def in-memory-indexes (create-in-memory-indexes))
 
-  (def in-memory-indexes (create-in-memory-indexes))
+(comment
+  (:columns (:food-description-token-data-type-food indexes))
+
+
 
   (medley/map-vals (fn [index]
                      (update index
@@ -457,7 +365,7 @@
 
 
   (select (:foods-by-description in-memory-indexes)
-          [(starts-with "r")
+          [(query/starts-with "r")
            :?data-type
            :?id])
 
@@ -466,14 +374,14 @@
 
 
   (select-unique (:foods-by-description in-memory-indexes)
-                 [(starts-with "r")])
+                 [(query/starts-with "r")])
 
   (("raw") ("red"))
 
 
 
   (unify-unique (:foods-by-description in-memory-indexes)
-                [(starts-with "r" :?token)])
+                [(query/starts-with "r" :?token)])
 
   ({:?token "raw"}
    {:?token "red"})
@@ -481,7 +389,7 @@
 
 
   (unify-unique (:foods-by-description in-memory-indexes)
-                [(-> (starts-with "r" :?token)
+                [(-> (query/starts-with "r" :?token)
                      (rename :?description-token))])
 
   ({:?description-token "raw"}
@@ -512,14 +420,132 @@
               ["cabbage"
                :*
                (rename :?id :?food)])
-       (loop-join (:foods in-memory-indexes)
-                  [(rename :?id :?food)
-                   :*
-                   :?description]))
+       (query/loop-join (:foods in-memory-indexes)
+                        [(rename :?id :?food)
+                         :*
+                         :?description]))
 
   ({:?food 169975, :?description "Cabbage, raw"}
    {:?food 787782, :?description "Cabbage, red, raw"})
 
+
+
+  (select (:foods in-memory-indexes)
+          [:*
+           :*
+           (query/starts-with "Car")])
+
+  ((170393 "sr_legacy_food" "Carrots, raw")
+   (787522 "survey_fndds_food" "Carrots, raw"))
+
+
+
+  (unify (:foods in-memory-indexes)
+         [:*
+          :*
+          (query/starts-with "Car" :?description)])
+
+  ({:?description "Carrots, raw"}
+   {:?description "Carrots, raw"})
+
+
+  (merge-join (:foods-by-description in-memory-indexes)
+              ["cabbage"
+               :?data-type
+               :?id]
+
+              (:foods-by-description in-memory-indexes)
+              ["raw"
+               :?data-type
+               :?id])
+
+  [{:?data-type "sr_legacy_food", :?id 169975}
+   {:?data-type "survey_fndds_food", :?id 787782}]
+
+
+  (->> (merge-join [[(:foods-by-description in-memory-indexes)
+                     ["cabbage"
+                      :?data-type
+                      :?id]]
+
+                    [(:foods-by-description in-memory-indexes)
+                     ["raw"
+                      :?data-type
+                      :?id]]])
+       (query/loop-join (:foods in-memory-indexes)
+                        [:?id
+                         :?data-type
+                         :?description]))
+
+  ({:?data-type "sr_legacy_food", :?id 169975, :?description "Cabbage, raw"}
+   {:?data-type "survey_fndds_food", :?id 787782, :?description "Cabbage, red, raw"})
+
+
+  (->> (merge-join (for [token ["cabbage" "raw"]]
+                     [(:foods-by-description in-memory-indexes)
+                      [token
+                       :?data-type
+                       :?id]]))
+       (query/loop-join (:foods in-memory-indexes)
+                        [:?id
+                         :?data-type
+                         :?description]))
+
+  ({:?data-type "sr_legacy_food", :?id 169975, :?description "Cabbage, raw"}
+   {:?data-type "survey_fndds_food", :?id 787782, :?description "Cabbage, red, raw"})
+
+
+  ;; TODO: make this work, differentiate filter terms from range terms query/starts-with is a range because it matches only to a single continous range of sorted values
+  ;; even? is a filter
+
+  ;; common pattern is preceded with variables, thus multiple merge joins are needed
+
+  (->> (query/merge-join (for [token ["ca" "raw"]]
+                           [(:foods-by-description in-memory-indexes)
+                            [(query/starts-with token)
+                             :?data-type
+                             :?id]]))
+       (query/loop-join (:foods in-memory-indexes)
+                        [:?id
+                         :?data-type
+                         :?description]))
+
+  (->> (for [token-combination (query/cartesian-product (for [query-string ["ca" "r"]]
+                                                          (map first
+                                                               (select-unique (:foods-by-description in-memory-indexes)
+                                                                              [(query/starts-with query-string)]))))]
+         (merge-join (for [token token-combination]
+                       [(:foods-by-description in-memory-indexes)
+                        [#_(rename (query/equals :?token token)
+                                   {:token token})
+                         token
+                         :?data-type
+                         :?id]])))
+       (apply concat)
+       (distinct)
+       (query/loop-join (:foods in-memory-indexes)
+                        [:?id
+                         :?data-type
+                         :?description]))
+
+
+  (->> (for [token-combination (query/cartesian-product (for [query-string ["ca" "r"]]
+                                                          (map first
+                                                               (query/select-unique (:foods-by-description in-memory-indexes)
+                                                                              [(query/starts-with query-string)]))))]
+         (query/merge-join (for [token token-combination]
+                             [(:foods-by-description in-memory-indexes)
+                              [#_(rename (query/equals :?token token)
+                                         {:token token})
+                               token
+                               :?data-type
+                               :?id]])))
+       (apply concat)
+       (distinct)
+       (query/loop-join (:foods in-memory-indexes)
+                        [:?id
+                         :?data-type
+                         :?description]))
 
   )
 
@@ -528,33 +554,28 @@
 
 
 
-
-
-
-
-
 (comment
+
   (select (:foods in-memory-indexes)
           [:*
            :*
-           (starts-with "P")])
-
+           (query/starts-with "Cab")])
 
   ;; add check to merge join: no variables are allowed before the common sub pattern in merge join
-  (->> (unify (:foods-by-description in-memory-indexes)
-              ["cabbage"
-               :*
-               (rename :?id :?food)])
-       (query/merge-join (:foods in-memory-indexes)
-                         [(rename :?id :?food)
-                          :*
-                          :?description]))
+
+  (:columns (:foods-by-description in-memory-indexes))
+  ;; => (:token :data-type :id)
+
+  (:columns (:foods in-memory-indexes))
+  ;; => (:id :data-type :description)
+
+
 
 
   (def result (for [token ["r" "ca"]]
                 (map first
                      (select-unique (:foods-by-description in-memory-indexes)
-                                    [(starts-with token)]))))
+                                    [(query/starts-with token)]))))
 
   (def result '(("raw" "red")
                 ("cabbage" "carrots" "cauliflower")))
@@ -591,9 +612,9 @@
 
 
 
-  (def result (loop-join (:foods in-memory-indexes)
-                         [:?food :* :?description]
-                         result))
+  (def result (query/loop-join (:foods in-memory-indexes)
+                               [:?food :* :?description]
+                               result))
 
   (def result '({:?data-type "sr_legacy_food", :?food 169975, :?description "Cabbage, raw"}
                 {:?data-type "survey_fndds_food", :?food 787782, :?description "Cabbage, red, raw"}
@@ -605,38 +626,40 @@
 
   ) ;; TODO: remove-me
 
+(defonce indexes (open-indexes))
+
 (comment
-  (def indexes (open-indexes))
+
 
   (time (let [in-memory-indexes (create-in-memory-indexes)]
           (->> (selection-product (for [token ["raw" "ca"]]
                                     {:sorted (:foods-by-description in-memory-indexes)
-                                     :pattern [(starts-with token)
+                                     :pattern [(query/starts-with token)
                                                :?data-type
                                                :?food]}))
                (map query/merge-join)
                (apply concat)
-               (loop-join (:foods in-memory-indexes)
-                          [:?food :* :?description]))))
+               (query/loop-join (:foods in-memory-indexes)
+                                [:?food :* :?description]))))
 
   (time (let [in-memory-indexes (create-in-memory-indexes)]
           (->> (selection-product (for [token ["raw" "ca"]]
                                     {:sorted (:foods-by-description in-memory-indexes)
-                                     :pattern [(starts-with token)
+                                     :pattern [(query/starts-with token)
                                                :?data-type
                                                :?food]}))
                (map query/merge-join)
                (apply concat)
-               (loop-join (:foods in-memory-indexes)
-                          [:?food :* :?description]))))
+               (query/loop-join (:foods in-memory-indexes)
+                                [:?food :* :?description]))))
 
   (time (let [in-memory-indexes (create-in-memory-indexes)]
           (->> (query/select (:foods in-memory-indexes)
                              [:?food])
-               (loop-join (:food-nutrient-amount indexes)
-                          [:?food :?nutrient :?amount :?id])
-               (loop-join (:nutrients in-memory-indexes)
-                          [:?nutrient])
+               (query/loop-join (:food-nutrient-amount indexes)
+                                [:?food :?nutrient :?amount :?id])
+               (query/loop-join (:nutrients in-memory-indexes)
+                                [:?nutrient])
                (take 10)
                (doall))))
 
@@ -666,8 +689,8 @@
                                                   {:sorted (:nutrients in-memory-indexes)
                                                    :pattern [:?nutrient]}])
                     (sort-by (juxt :?food :?nutrient))
-                    (loop-join (:food-nutrient-amount indexes)
-                               [:?food :?nutrient :?amount :?id])))))
+                    (query/loop-join (:food-nutrient-amount indexes)
+                                     [:?food :?nutrient :?amount :?id])))))
 
   (time (vec (let [in-memory-indexes (create-in-memory-indexes)]
                (query/merge-join [{:sorted (->> (merged-substitution-product [{:sorted (:foods in-memory-indexes)
@@ -708,18 +731,18 @@
 
   (->> (query/select (:food-description-token-data-type-food indexes)
                      ["carrot" :?data-type :?food])
-       (loop-join (:food-data-type-description indexes)
-                  [:?food :?data-type :?description])
-       (loop-join (:food-nutrient-amount indexes)
-                  [:?food :?nutrient-id :?amount :?measurement-id])
+       (query/loop-join (:food-data-type-description indexes)
+                        [:?food :?data-type :?description])
+       (query/loop-join (:food-nutrient-amount indexes)
+                        [:?food :?nutrient-id :?amount :?measurement-id])
 
        (take 100))
 
 
   (->> (query/select (:food-nutrient-amount indexes)
                      [169043 :?nutrient-id :?amount :?measurement-id])
-       (loop-join (:nutrients-by-id indexes)
-                  [:?nutrient-id :?name :?unit-name :?nutrient-nbr :?rank])
+       (query/loop-join (:nutrients-by-id indexes)
+                        [:?nutrient-id :?name :?unit-name :?nutrient-nbr :?rank])
        (take 100))
 
   (->> (query/select (:nutrients-by-id indexes)
@@ -736,11 +759,11 @@
 
 
   (take 100 (product [{:sorted (:food-description-token-data-type-food indexes)
-                       :pattern [(starts-with "rai")]}
+                       :pattern [(query/starts-with "rai")]}
                       {:sorted (:food-description-token-data-type-food indexes)
-                       :pattern [(starts-with "carr")]}]))
+                       :pattern [(query/starts-with "carr")]}]))
 
-  ;; TODO: figure out better name for loop-join and the terminology overall
+  ;; TODO: figure out better name for query/loop-join and the terminology overall
 
   (->> (query/merge-join [{:sorted (:food-description-token-data-type-food indexes)
                            :pattern ["raw"
@@ -750,8 +773,8 @@
                            :pattern ["carrots"
                                      :?data-type
                                      :?food]}])
-       (loop-join (:food-data-type-description indexes)
-                  [:?food :?data-type :?description])
+       (query/loop-join (:food-data-type-description indexes)
+                        [:?food :?data-type :?description])
        (take 100))
 
   (:log (btree/get-log-and-result (fn []
@@ -763,7 +786,7 @@
   (take 10 (let [tokens ["raw" "carrot"]
                  participants (for [token tokens]
                                 {:sorted (:food-description-token-data-type-food indexes)
-                                 :pattern [(starts-with token token)
+                                 :pattern [(query/starts-with token token)
                                            :?data-type
                                            :?food]})]
              (merge-join-with-prefixes participants)
@@ -773,33 +796,33 @@
 
   (concat-merge-joins (selection-product (for [token ["raw" "carrot"]]
                                            {:sorted (:food-description-token-data-type-food indexes)
-                                            :pattern [(starts-with token)
+                                            :pattern [(query/starts-with token)
                                                       :?data-type
                                                       :?food]})))
 
   (for [participant-combination (selection-product (for [token ["raw" "carrot"]]
                                                      {:sorted (:food-description-token-data-type-food indexes)
-                                                      :pattern [(starts-with token)
+                                                      :pattern [(query/starts-with token)
                                                                 :?data-type
                                                                 :?food]}))]
     (map :pattern participant-combination))
 
 
-  (time (loop-join (:food-data-type-description indexes)
-                   [:?food :?data-type :?description]
-                   (concat-merge-joins (selection-product (for [token ["raw" "carrot"]]
-                                                            {:sorted (:food-description-token-data-type-food indexes)
-                                                             :pattern [(starts-with token)
-                                                                       :?data-type
-                                                                       :?food]})))))
+  (time (query/loop-join (:food-data-type-description indexes)
+                         [:?food :?data-type :?description]
+                         (concat-merge-joins (selection-product (for [token ["raw" "carrot"]]
+                                                                  {:sorted (:food-description-token-data-type-food indexes)
+                                                                   :pattern [(query/starts-with token)
+                                                                             :?data-type
+                                                                             :?food]})))))
 
   (product (for [token ["raw" "carrot"]]
              {:sorted (:food-description-token-data-type-food indexes)
-              :pattern [(starts-with token)]}))
+              :pattern [(query/starts-with token)]}))
 
   (substitution-product (for [token ["raw" "carrot"]]
                           {:sorted (:food-description-token-data-type-food indexes)
-                           :pattern [(starts-with token :?token)]}))
+                           :pattern [(query/starts-with token :?token)]}))
 
   (let [join-keys [:?data-type :?food]])
 
@@ -844,23 +867,23 @@
 
   (->> (:log (btree/get-log-and-result (fn []
                                          (doall (take 1000 (query/cartesian-product [(query/unique-substitutions (:food-description-token-data-type-food indexes)
-                                                                                                                 [(starts-with "ra" :?token)])
+                                                                                                                 [(query/starts-with "ra" :?token)])
                                                                                      (query/unique-substitutions (:food-description-token-data-type-food indexes)
-                                                                                                                 [(starts-with "ca" :?token)])]))))))
+                                                                                                                 [(query/starts-with "ca" :?token)])]))))))
        (filter (comp #{:load-node-3}
                      first)))
 
   (substitution-product (for [token ["raw" "carrot"]]
                           {:sorted (:food-description-token-data-type-food indexes)
-                           :pattern [(starts-with token :?token)]}))
+                           :pattern [(query/starts-with token :?token)]}))
 
   (count (query/cartesian-product [(query/unique-substitutions (:food-description-token-data-type-food indexes)
-                                                               [(starts-with "raw" :?token)])
+                                                               [(query/starts-with "raw" :?token)])
                                    (query/unique-substitutions (:food-description-token-data-type-food indexes)
-                                                               [(starts-with "carrot" :?token)])]))
+                                                               [(query/starts-with "carrot" :?token)])]))
 
   (take 10 (query/subsequence (:food-description-token-data-type-food indexes)
-                              [(starts-with "carrot" :?token)
+                              [(query/starts-with "carrot" :?token)
                                :?data-type]))
   ;; => (["carrot" "sr_legacy_food" 169043]
   ;;     ["carrot" "sr_legacy_food" 170491]
@@ -874,7 +897,7 @@
   ;;     ["carrot" "survey_fndds_food" 784765])
 
   (take 10 (query/unique-subsequence (:food-description-token-data-type-food indexes)
-                                     [(starts-with "carrot" :?token)
+                                     [(query/starts-with "carrot" :?token)
                                       :?data-type]))
   ;; => (("carrot" "sr_legacy_food")
   ;;     ("carrot" "survey_fndds_food")
@@ -888,7 +911,7 @@
   ;;     ("cas" "sub_sample_food"))
 
   (query/matching-unique-subsequence (:food-description-token-data-type-food indexes)
-                                     [(starts-with "carrot" :?token)
+                                     [(query/starts-with "carrot" :?token)
                                       :?data-type])
   ;; => (("carrot" "sr_legacy_food")
   ;;     ("carrot" "survey_fndds_food")
@@ -900,7 +923,7 @@
   ;;     ("carrots" "survey_fndds_food"))
 
   (query/unique-substitutions (:food-description-token-data-type-food indexes)
-                              [(starts-with "carrot" :?token)
+                              [(query/starts-with "carrot" :?token)
                                :?data-type])
   ;; => ({:?token "carrot", :?data-type "sr_legacy_food"}
   ;;     {:?token "carrot", :?data-type "survey_fndds_food"}
@@ -940,7 +963,7 @@
   (reduce reduction/value-count
           0
           (query/substitution-reducible (:food-description-token-data-type-food indexes)
-                                        [(starts-with "raw") :* :?food]))
+                                        [(query/starts-with "raw") :* :?food]))
 
   (let [raw-foods (into #{}
                         (map :?food)
